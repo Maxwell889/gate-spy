@@ -359,3 +359,99 @@ class TestComplexVerilog:
         assert c.simulate({}) == {
             "y[3]": 1, "y[2]": 0, "y[1]": 1, "y[0]": 0,
         }
+
+
+# ---------------------------------------------------------------------------
+# DOT / Graphviz visualization
+# ---------------------------------------------------------------------------
+
+class TestDotVisualization:
+    """``to_dot()`` generates valid Graphviz DOT for the circuit DAG."""
+
+    def test_to_dot_produces_valid_dot_format(self, example_lib, tmp_path):
+        src = """
+        module top(a, b, y);
+          input a, b;
+          output y;
+          wire a, b, y;
+          AND _0_ ( .A(a), .B(b), .Y(y) );
+        endmodule
+        """
+        c = Circuit.from_string(src, example_lib)
+        dot_file = tmp_path / "top.dot"
+        c.to_dot(str(dot_file))
+        content = dot_file.read_text()
+        assert content.startswith("digraph top {")
+        assert "rankdir=LR" in content
+        assert 'label="a"' in content       # PI node
+        assert 'label="b"' in content       # PI node
+        assert 'label="y"' in content       # PO node
+        assert 'label="AND"' in content     # gate node
+        assert "->" in content              # edges present
+        assert content.strip().endswith("}")
+
+    def test_to_dot_node_shapes_and_colors(self, example_lib, tmp_path):
+        src = """
+        module colors(a, y);
+          input a;
+          output y;
+          wire a, y;
+          NOT _0_ ( .A(a), .Y(y) );
+        endmodule
+        """
+        c = Circuit.from_string(src, example_lib)
+        dot_file = tmp_path / "colors.dot"
+        c.to_dot(str(dot_file))
+        content = dot_file.read_text()
+        # PI: box shape, steel blue fill
+        assert "shape=box" in content
+        assert "#D4E6F1" in content    # PI fill
+        assert "#FADBD8" in content    # PO fill
+        # Gate: ellipse shape with auto-generated colour (hex pattern)
+        assert "shape=ellipse" in content
+        # every ellipse node should have a fill colour
+        assert 'fillcolor="#' in content
+
+    def test_to_dot_constants_use_diamond(self, example_lib, tmp_path):
+        src = """
+        module consts(a, y);
+          input a;
+          output y;
+          wire a, y;
+          AND _0_ ( .A(a), .B(1'b1), .Y(y) );
+        endmodule
+        """
+        c = Circuit.from_string(src, example_lib)
+        dot_file = tmp_path / "consts.dot"
+        c.to_dot(str(dot_file))
+        content = dot_file.read_text()
+        assert "shape=diamond" in content
+        assert "CONST1" in content
+
+    def test_to_dot_on_synthesized_circuit(self, synth_circuit, tmp_path):
+        dot_file = tmp_path / "synth.dot"
+        synth_circuit.to_dot(str(dot_file))
+        content = dot_file.read_text()
+        assert content.startswith("digraph MulRecFN {")
+        # Verify the gate types that are present in the synthed circuit appear
+        hist = synth_circuit.gate_histogram()
+        for kind in hist:
+            assert kind in content
+        # At least as many edges as gate nodes
+        assert content.count("->") >= len(synth_circuit.gate_nodes)
+
+    def test_to_dot_rank_constraints(self, example_lib, tmp_path):
+        src = """
+        module ranks(a, y);
+          input a;
+          output y;
+          wire a, y;
+          BUF _0_ ( .A(a), .Y(y) );
+        endmodule
+        """
+        c = Circuit.from_string(src, example_lib)
+        dot_file = tmp_path / "ranks.dot"
+        c.to_dot(str(dot_file))
+        content = dot_file.read_text()
+        assert "rank=source" in content
+        assert "rank=sink" in content
