@@ -1,6 +1,10 @@
 [project]
 name = "gate-lifter"
 version = "0.1.0"
-description = "Add your description here"
+description = "An LLM-agent-based framework for reasoning over gate-level netlists"
 requires-python = ">=3.11"
 dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+pythonpath = ["."]
