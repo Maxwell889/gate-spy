@@ -216,11 +216,16 @@ class Circuit:
             hist[kind] = hist.get(kind, 0) + 1
         return hist
 
-    def summary(self) -> str:
-        parts = [f"{k}:{v}" for k, v in sorted(self.gate_histogram().items())]
-        return (f"Circuit({self.name}, PIs={len(self.pi_nodes)}, "
-                f"POs={len(self.po_nodes)}, gates={len(self.gate_nodes)} "
-                f"[{', '.join(parts)}])")
+    def stats(self) -> dict:
+        """Structured statistics of the circuit (JSON-serialisable)."""
+        return {
+            "name": self.name,
+            "inputs": len(self.pi_nodes),
+            "outputs": len(self.po_nodes),
+            "gates": len(self.gate_nodes),
+            "nodes": len(self.nodes),
+            "gate_histogram": self.gate_histogram(),
+        }
 
     def __repr__(self) -> str:
         return self.summary()
