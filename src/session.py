@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 from .library import Library
-from .circuit import Circuit
+from .circuit import Circuit, extract_adders, extract_xor
 from .circuit.aig_parser import DEFAULT_LIB_PATH
 
 # File extensions we know how to parse.
@@ -40,8 +40,8 @@ class CircuitSession:
 
     # -- operations -----------------------------------------------------
 
-    def load(self, path: str) -> dict:
-        """Parse *path* into the current circuit and return its statistics.
+    def load(self, path: str) -> str:
+        """Parse *path* into the current circuit and return its summary.
 
         Dispatches on the file extension: ``.v``/``.sv``/``.verilog`` are read
         as gate-level Verilog (against the default library), ``.aig``/``.aag``
@@ -67,12 +67,23 @@ class CircuitSession:
 
         self.circuit = circuit
         self.source = path
-        return {"source": path, "format": fmt, **circuit.stats()}
+        return f"Loaded {fmt} file {path}\n{circuit.summary()}"
 
-    def stats(self) -> dict:
-        """Statistics of the current circuit, or raise if none is loaded."""
+    def _current(self) -> Circuit:
         if self.circuit is None:
             raise NoCircuitLoadedError(
                 "no circuit loaded; call read_file(path) first"
             )
-        return {"source": self.source, **self.circuit.stats()}
+        return self.circuit
+
+    def summary(self) -> str:
+        """One-line summary of the current circuit, or raise if none is loaded."""
+        return self._current().summary()
+
+    def xor_stats(self) -> str:
+        """Extract XOR gates from the current circuit and report chain structure."""
+        return extract_xor(self._current()).report()
+
+    def adder_stats(self) -> str:
+        """Extract half/full adders and report the largest adder tree."""
+        return extract_adders(self._current()).report()

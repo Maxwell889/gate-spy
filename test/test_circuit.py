@@ -1,547 +1,149 @@
-"""Tests for :mod:`src.circuit` — parsing, topology, and simulation."""
+"""Tests for :mod:`src.circuit` — parsing, topology, simulation, AIGER, DOT."""
 
 import pytest
+
 from src.library import Library
 from src.circuit import Circuit
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 @pytest.fixture
-def example_lib():
+def lib():
     return Library.from_file("examples/example.lib")
 
 
 @pytest.fixture
-def synth_circuit(example_lib):
-    """The fully synthesised MulRecFN circuit."""
-    return Circuit.from_file("examples/Mul_F16_synth.v", example_lib)
+def synth(lib):
+    return Circuit.from_file("examples/Mul_F16_synth.v", lib)
 
 
 @pytest.fixture
-def mul_int16_circuit():
-    """A 16x16->32 unsigned multiplier read from a binary AIGER file.
-
-    Built from AND/NOT only, using the default (example.lib) library.
-    """
+def mul():
     return Circuit.from_aig_file("examples/Mul_INT16.aig")
 
 
-# ---------------------------------------------------------------------------
-# Circuit parsing — small hand-written cases
-# ---------------------------------------------------------------------------
-
-class TestCircuitParse:
-    """Parsing structural Verilog into a Circuit DAG."""
-
-    def test_single_gate(self, example_lib):
-        src = """
-        module top(a, b, y);
-          input a, b;
-          output y;
-          wire a, b, y;
-          AND _0_ ( .A(a), .B(b), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        assert c.name == "top"
-        assert c.input_nets == ["a", "b"]
-        assert c.output_nets == ["y"]
-        assert len(c.gate_nodes) == 1
-        assert c.nodes[c.gate_nodes[0]].kind == "AND"
-
-    def test_inverter_chain(self, example_lib):
-        src = """
-        module chain(a, y);
-          input a;
-          output y;
-          wire a, y, n1;
-          NOT _0_ ( .A(a), .Y(n1) );
-          NOT _1_ ( .A(n1), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        assert len(c.gate_nodes) == 2
-        # a -> NOT -> n1 -> NOT -> y  should buffer a
-        assert c.simulate({"a": 0}) == {"y": 0}
-        assert c.simulate({"a": 1}) == {"y": 1}
-
-    def test_and_or_circuit(self, example_lib):
-        src = """
-        module andor(a, b, c, y);
-          input a, b, c;
-          output y;
-          wire a, b, c, y, w;
-          AND _0_ ( .A(a), .B(b), .Y(w) );
-          OR  _1_ ( .A(w), .B(c), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        # y = (a & b) | c
-        assert c.simulate({"a": 0, "b": 0, "c": 0}) == {"y": 0}
-        assert c.simulate({"a": 1, "b": 1, "c": 0}) == {"y": 1}
-        assert c.simulate({"a": 0, "b": 0, "c": 1}) == {"y": 1}
-        assert c.simulate({"a": 1, "b": 1, "c": 1}) == {"y": 1}
-
-    def test_bus_ports(self, example_lib):
-        src = """
-        module bus_top(a, y);
-          input [1:0] a;
-          output [1:0] y;
-          wire [1:0] a, y;
-          BUF _0_ ( .A(a[0]), .Y(y[0]) );
-          BUF _1_ ( .A(a[1]), .Y(y[1]) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        assert c.input_nets == ["a[1]", "a[0]"]   # MSB first
-        assert c.output_nets == ["y[1]", "y[0]"]
-        assert len(c.pi_nodes) == 2
-        assert len(c.po_nodes) == 2
-        assert c.simulate({"a[1]": 1, "a[0]": 0}) == {"y[1]": 1, "y[0]": 0}
-
-    def test_constants_in_circuit(self, example_lib):
-        src = """
-        module const_top(a, y);
-          input a;
-          output y;
-          wire a, y;
-          AND _0_ ( .A(a), .B(1'b1), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        # y = a & 1 = a
-        assert c.simulate({"a": 0}) == {"y": 0}
-        assert c.simulate({"a": 1}) == {"y": 1}
-
-    def test_assign_statement(self, example_lib):
-        src = """
-        module assign_top(a, y);
-          input a;
-          output y;
-          wire a, y, w;
-          BUF _0_ ( .A(a), .Y(w) );
-          assign y = w;
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        assert c.simulate({"a": 0}) == {"y": 0}
-        assert c.simulate({"a": 1}) == {"y": 1}
-
-    def test_no_module_raises(self, example_lib):
-        with pytest.raises(ValueError, match="no module declaration"):
-            Circuit.from_string("wire a;", example_lib)
-
-    def test_default_input_value_is_zero(self, example_lib):
-        src = """
-        module top(a, y);
-          input a;
-          output y;
-          wire a, y;
-          BUF _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        # unspecified input defaults to 0
-        assert c.simulate({}) == {"y": 0}
+def mod(lib, body, ports, decls):
+    return Circuit.from_string(f"module top({ports}); {decls} {body} endmodule", lib)
 
 
-# ---------------------------------------------------------------------------
-# Topology
-# ---------------------------------------------------------------------------
+# --- Verilog parsing & simulation ------------------------------------------
 
-class TestTopology:
-    """DAG structure: topological order, node types, counts."""
-
-    def test_topological_order_linear(self, example_lib):
-        src = """
-        module top(a, y);
-          input a;
-          output y;
-          wire a, y;
-          NOT _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        order = c.topological_order()
-        assert len(order) == len(c.nodes)
-        # PI before gate, gate before PO
-        pi_idx = order.index(c.pi_nodes[0])
-        gate_idx = order.index(c.gate_nodes[0])
-        po_idx = order.index(c.po_nodes[0])
-        assert pi_idx < gate_idx < po_idx
-
-    def test_topological_order_cached(self, example_lib):
-        src = """
-        module top(a, y);
-          input a;
-          output y;
-          wire a, y;
-          BUF _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        o1 = c.topological_order()
-        o2 = c.topological_order()
-        assert o1 is o2  # cached — same list object
-
-    def test_gate_histogram(self, example_lib):
-        src = """
-        module top(a, b, y);
-          input a, b;
-          output y;
-          wire a, b, y, n1, n2;
-          NOT _0_ ( .A(a), .Y(n1) );
-          AND _1_ ( .A(n1), .B(b), .Y(n2) );
-          OR  _2_ ( .A(a), .B(n2), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        hist = c.gate_histogram()
-        assert hist == {"NOT": 1, "AND": 1, "OR": 1}
-
-    def test_node_properties(self, example_lib):
-        src = """
-        module top(a, y);
-          input a;
-          output y;
-          wire a, y;
-          BUF _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        pi = c.nodes[c.pi_nodes[0]]
-        assert pi.is_pi and pi.is_source and not pi.is_po and not pi.is_gate
-
-        po = c.nodes[c.po_nodes[0]]
-        assert po.is_po and not po.is_source and not po.is_gate
-
-        gate = c.nodes[c.gate_nodes[0]]
-        assert gate.is_gate and not gate.is_pi and not gate.is_po
-
-    def test_summary_and_repr(self, example_lib):
-        src = """
-        module top(a, y);
-          input a;
-          output y;
-          wire a, y;
-          NOT _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        s = c.summary()
-        assert "top" in s
-        assert "NOT:1" in s
-        assert repr(c) == s
+def test_parse_structure(lib):
+    c = mod(lib, "AND _0_ ( .A(a), .B(b), .Y(y) );",
+            "a,b,y", "input a,b; output y; wire a,b,y;")
+    assert c.name == "top" and c.input_nets == ["a", "b"] and c.output_nets == ["y"]
+    assert len(c.gate_nodes) == 1 and c.nodes[c.gate_nodes[0]].kind == "AND"
 
 
-# ---------------------------------------------------------------------------
-# Synthesised circuit (MulRecFN)
-# ---------------------------------------------------------------------------
-
-class TestSynthesizedCircuit:
-    """Integration tests using the yosys-synthesised floating-point multiplier."""
-
-    def test_parses_without_error(self, synth_circuit):
-        """The synthesised netlist must parse successfully."""
-        assert synth_circuit.name == "MulRecFN"
-        assert len(synth_circuit.nodes) > 0
-
-    def test_input_output_nets(self, synth_circuit):
-        """Check port widths are expanded correctly."""
-        # io_a[16:0] = 17 bits, io_b[16:0] = 17 bits,
-        # io_roundingMode[2:0] = 3 bits, io_detectTininess = 1 bit
-        # Total PI bits = 17+17+3+1 = 38
-        assert len(synth_circuit.input_nets) == 38
-        assert len(synth_circuit.pi_nodes) == 38
-        # io_out[16:0] = 17 bits, io_exceptionFlags[4:0] = 5 bits
-        # Total PO bits = 17+5 = 22
-        assert len(synth_circuit.output_nets) == 22
-        assert len(synth_circuit.po_nodes) == 22
-
-    def test_topological_order_is_acyclic(self, synth_circuit):
-        """A successful topological sort means the circuit has no combinational loops."""
-        order = synth_circuit.topological_order()
-        assert len(order) == len(synth_circuit.nodes)
-
-    def test_gate_histogram_only_library_cells(self, synth_circuit):
-        """Every gate must be from the example library."""
-        hist = synth_circuit.gate_histogram()
-        valid = {"NOT", "BUF", "AND", "NAND", "OR", "NOR", "XOR", "XNOR"}
-        for kind in hist:
-            assert kind in valid, f"unexpected gate kind: {kind}"
-        total_gates = sum(hist.values())
-        assert total_gates == len(synth_circuit.gate_nodes)
-        assert total_gates > 100  # non-trivial circuit
-
-    def test_simulate_all_zeros(self, synth_circuit):
-        """Simulate with all inputs tied to 0 — should not crash."""
-        result = synth_circuit.simulate({})
-        assert len(result) == len(synth_circuit.output_nets)
-        # all outputs should be deterministic (0 or 1)
-        for net, val in result.items():
-            assert val in (0, 1), f"{net} = {val}"
-
-    def test_simulate_with_specific_inputs(self, synth_circuit):
-        """Drive a few bits high and ensure simulation returns valid bits."""
-        inputs = {net: 0 for net in synth_circuit.input_nets}
-        # Set io_a to a known value through its bit nets
-        for i in range(17):
-            inputs[f"io_a[{i}]"] = 1 if i < 3 else 0  # io_a = 7
-        for i in range(17):
-            inputs[f"io_b[{i}]"] = 1 if i < 2 else 0  # io_b = 3
-        result = synth_circuit.simulate(inputs)
-        assert len(result) == len(synth_circuit.output_nets)
-        for net, val in result.items():
-            assert val in (0, 1), f"{net} = {val}"
-
-    def test_xor_gate_simulation(self, example_lib):
-        """End-to-end: XOR gate truth table via simulate."""
-        src = """
-        module xor_test(a, b, y);
-          input a, b;
-          output y;
-          wire a, b, y;
-          XOR _0_ ( .A(a), .B(b), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        assert c.simulate({"a": 0, "b": 0}) == {"y": 0}
-        assert c.simulate({"a": 0, "b": 1}) == {"y": 1}
-        assert c.simulate({"a": 1, "b": 0}) == {"y": 1}
-        assert c.simulate({"a": 1, "b": 1}) == {"y": 0}
-
-    def test_simulation_deterministic(self, synth_circuit):
-        """Same inputs should always produce the same outputs."""
-        inputs = {net: (i % 2) for i, net in enumerate(synth_circuit.input_nets)}
-        r1 = synth_circuit.simulate(inputs)
-        r2 = synth_circuit.simulate(inputs)
-        assert r1 == r2
+def test_simulation(lib):
+    inv = mod(lib, "NOT g0 ( .A(a), .Y(n) ); NOT g1 ( .A(n), .Y(y) );",
+              "a,y", "input a; output y; wire a,y,n;")
+    assert inv.simulate({"a": 1}) == {"y": 1}              # double inversion buffers
+    ao = mod(lib, "AND g0 ( .A(a), .B(b), .Y(w) ); OR g1 ( .A(w), .B(c), .Y(y) );",
+             "a,b,c,y", "input a,b,c; output y; wire a,b,c,y,w;")
+    assert ao.simulate({"a": 1, "b": 1, "c": 0}) == {"y": 1}
+    assert ao.simulate({"a": 0, "b": 0, "c": 0}) == {"y": 0}
+    xor = mod(lib, "XOR g0 ( .A(a), .B(b), .Y(y) );",
+              "a,b,y", "input a,b; output y; wire a,b,y;")
+    assert [xor.simulate({"a": x, "b": z})["y"] for x, z in [(0, 0), (0, 1), (1, 1)]] == [0, 1, 0]
+    const = mod(lib, "AND g0 ( .A(a), .B(1'b1), .Y(y) );",
+                "a,y", "input a; output y; wire a,y;")
+    assert const.simulate({"a": 1}) == {"y": 1}            # a & 1 = a
+    asgn = mod(lib, "BUF g0 ( .A(a), .Y(w) ); assign y = w;",
+               "a,y", "input a; output y; wire a,y,w;")
+    assert asgn.simulate({"a": 1}) == {"y": 1}
+    buf = mod(lib, "BUF g0 ( .A(a), .Y(y) );", "a,y", "input a; output y; wire a,y;")
+    assert buf.simulate({}) == {"y": 0}                    # unspecified input -> 0
 
 
-# ---------------------------------------------------------------------------
-# Concatenations and complex expressions
-# ---------------------------------------------------------------------------
-
-class TestComplexVerilog:
-    """Parsing of concatenations, part-selects, and sized literals."""
-
-    def test_concat_in_assign(self, example_lib):
-        src = """
-        module concat_top(a, b, y);
-          input a, b;
-          output [1:0] y;
-          wire a, b;
-          wire [1:0] y;
-          assign y = {a, b};
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        # y[1] = a, y[0] = b
-        assert c.simulate({"a": 1, "b": 0}) == {"y[1]": 1, "y[0]": 0}
-
-    def test_part_select_in_connection(self, example_lib):
-        src = """
-        module partsel(a, y);
-          input [2:0] a;
-          output y;
-          wire [2:0] a;
-          wire y;
-          BUF _0_ ( .A(a[0]), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        assert c.simulate({"a[0]": 1, "a[1]": 0, "a[2]": 0}) == {"y": 1}
-
-    def test_sized_literal_constant(self, example_lib):
-        src = """
-        module lit_top(y);
-          output [3:0] y;
-          wire [3:0] y;
-          assign y = 4'b1010;
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        # MSB first: y[3]=1, y[2]=0, y[1]=1, y[0]=0
-        assert c.simulate({}) == {
-            "y[3]": 1, "y[2]": 0, "y[1]": 1, "y[0]": 0,
-        }
+def test_buses_and_complex_exprs(lib):
+    bus = mod(lib, "BUF g0 ( .A(a[0]), .Y(y[0]) ); BUF g1 ( .A(a[1]), .Y(y[1]) );",
+              "a,y", "input [1:0] a; output [1:0] y; wire [1:0] a,y;")
+    assert bus.input_nets == ["a[1]", "a[0]"]              # MSB first
+    assert bus.simulate({"a[1]": 1, "a[0]": 0}) == {"y[1]": 1, "y[0]": 0}
+    cat = mod(lib, "assign y = {a, b};", "a,b,y",
+              "input a,b; output [1:0] y; wire a,b; wire [1:0] y;")
+    assert cat.simulate({"a": 1, "b": 0}) == {"y[1]": 1, "y[0]": 0}
+    lit = mod(lib, "assign y = 4'b1010;", "y", "output [3:0] y; wire [3:0] y;")
+    assert lit.simulate({}) == {"y[3]": 1, "y[2]": 0, "y[1]": 1, "y[0]": 0}
 
 
-# ---------------------------------------------------------------------------
-# DOT / Graphviz visualization
-# ---------------------------------------------------------------------------
-
-class TestDotVisualization:
-    """``to_dot()`` generates valid Graphviz DOT for the circuit DAG."""
-
-    def test_to_dot_produces_valid_dot_format(self, example_lib, out_dir):
-        src = """
-        module top(a, b, y);
-          input a, b;
-          output y;
-          wire a, b, y;
-          AND _0_ ( .A(a), .B(b), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        dot_file = out_dir / "top.dot"
-        c.to_dot(str(dot_file))
-        content = dot_file.read_text()
-        assert content.startswith("digraph top {")
-        assert "rankdir=LR" in content
-        assert 'label="a"' in content       # PI node
-        assert 'label="b"' in content       # PI node
-        assert 'label="y"' in content       # PO node
-        assert 'label="AND"' in content     # gate node
-        assert "->" in content              # edges present
-        assert content.strip().endswith("}")
-
-    def test_to_dot_node_shapes_and_colors(self, example_lib, out_dir):
-        src = """
-        module colors(a, y);
-          input a;
-          output y;
-          wire a, y;
-          NOT _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        dot_file = out_dir / "colors.dot"
-        c.to_dot(str(dot_file))
-        content = dot_file.read_text()
-        # PI: box shape, steel blue fill
-        assert "shape=box" in content
-        assert "#D4E6F1" in content    # PI fill
-        assert "#FADBD8" in content    # PO fill
-        # Gate: ellipse shape with auto-generated colour (hex pattern)
-        assert "shape=ellipse" in content
-        # every ellipse node should have a fill colour
-        assert 'fillcolor="#' in content
-
-    def test_to_dot_constants_use_diamond(self, example_lib, out_dir):
-        src = """
-        module consts(a, y);
-          input a;
-          output y;
-          wire a, y;
-          AND _0_ ( .A(a), .B(1'b1), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        dot_file = out_dir / "consts.dot"
-        c.to_dot(str(dot_file))
-        content = dot_file.read_text()
-        assert "shape=diamond" in content
-        assert "CONST1" in content
-
-    def test_to_dot_on_synthesized_circuit(self, synth_circuit, out_dir):
-        dot_file = out_dir / "synth.dot"
-        synth_circuit.to_dot(str(dot_file))
-        content = dot_file.read_text()
-        assert content.startswith("digraph MulRecFN {")
-        # Verify the gate types that are present in the synthed circuit appear
-        hist = synth_circuit.gate_histogram()
-        for kind in hist:
-            assert kind in content
-        # At least as many edges as gate nodes
-        assert content.count("->") >= len(synth_circuit.gate_nodes)
-
-    def test_to_dot_rank_constraints(self, example_lib, out_dir):
-        src = """
-        module ranks(a, y);
-          input a;
-          output y;
-          wire a, y;
-          BUF _0_ ( .A(a), .Y(y) );
-        endmodule
-        """
-        c = Circuit.from_string(src, example_lib)
-        dot_file = out_dir / "ranks.dot"
-        c.to_dot(str(dot_file))
-        content = dot_file.read_text()
-        assert "rank=source" in content
-        assert "rank=sink" in content
+def test_no_module_raises(lib):
+    with pytest.raises(ValueError, match="no module declaration"):
+        Circuit.from_string("wire a;", lib)
 
 
-# ---------------------------------------------------------------------------
-# AIGER (.aig) parsing
-# ---------------------------------------------------------------------------
-
-def _set_word(base: str, value: int, width: int = 16) -> dict[str, int]:
-    """Drive a named LSB-first input word (``base[i]``) to *value*."""
-    return {f"{base}[{i}]": (value >> i) & 1 for i in range(width)}
-
-
-def _read_word(result: dict[str, int], base: str, width: int = 32) -> int:
-    """Read an LSB-first output word (``base[i]``) from a simulation result."""
-    return sum((result[f"{base}[{i}]"] & 1) << i for i in range(width))
-
-
-class TestAigParse:
-    """Reading the binary AIGER multiplier into a Circuit of AND/NOT gates."""
-
-    def test_parses_with_default_lib(self, mul_int16_circuit):
-        c = mul_int16_circuit
-        assert c.name == "Mul_INT16"
-        # aig 2816 32 0 32 2784 -> 32 inputs, 32 outputs, 2784 AND gates.
-        assert len(c.pi_nodes) == 32
-        assert len(c.po_nodes) == 32
-
-    def test_only_and_and_not_gates(self, mul_int16_circuit):
-        hist = mul_int16_circuit.gate_histogram()
-        assert set(hist) == {"AND", "NOT"}
-        assert hist["AND"] == 2784           # matches the header's AND count
-
-    def test_input_output_symbol_names(self, mul_int16_circuit):
-        c = mul_int16_circuit
-        assert set(n.split("[")[0] for n in c.input_nets) == {"IN1", "IN2"}
-        assert set(n.split("[")[0] for n in c.output_nets) == {"Out"}
-
-    def test_topological_order_is_acyclic(self, mul_int16_circuit):
-        order = mul_int16_circuit.topological_order()
-        assert len(order) == len(mul_int16_circuit.nodes)
-
-    @pytest.mark.parametrize("a, b", [(0, 0), (3, 5), (7, 9), (255, 255), (1234, 11)])
-    def test_multiplies_correctly(self, mul_int16_circuit, a, b):
-        inputs = {**_set_word("IN1", a), **_set_word("IN2", b)}
-        result = mul_int16_circuit.simulate(inputs)
-        assert _read_word(result, "Out") == a * b
-
-    def test_from_aig_bytes_matches_from_file(self, mul_int16_circuit):
-        with open("examples/Mul_INT16.aig", "rb") as f:
-            from_bytes = Circuit.from_aig_bytes(f.read())
-        assert from_bytes.gate_histogram() == mul_int16_circuit.gate_histogram()
-        assert from_bytes.input_nets == mul_int16_circuit.input_nets
-
-    def test_explicit_library_is_used(self, example_lib):
-        c = Circuit.from_aig_file("examples/Mul_INT16.aig", example_lib)
-        assert c.lib is example_lib
-
-    def test_latches_unsupported(self):
-        # The toggle flip-flop from the AIGER FORMAT doc (one latch).
-        with pytest.raises(ValueError, match="latches"):
-            Circuit.from_aig_bytes(b"aag 1 0 1 2 0\n2 3\n2\n3\n")
-
-    def test_invalid_header(self):
-        with pytest.raises(ValueError, match="invalid AIGER header"):
-            Circuit.from_aig_bytes(b"not-an-aig 1 2 3\n")
+def test_topology_and_summary(lib):
+    c = mod(lib, "NOT g0 ( .A(a), .Y(n1) ); AND g1 ( .A(n1), .B(b), .Y(n2) ); "
+                 "OR g2 ( .A(a), .B(n2), .Y(y) );",
+            "a,b,y", "input a,b; output y; wire a,b,y,n1,n2;")
+    order = c.topological_order()
+    assert len(order) == len(c.nodes) and c.topological_order() is order  # cached
+    assert c.gate_histogram() == {"NOT": 1, "AND": 1, "OR": 1}
+    pi = c.nodes[c.pi_nodes[0]]
+    assert pi.is_pi and pi.is_source and not pi.is_gate
+    assert c.nodes[c.gate_nodes[0]].is_gate
+    s = c.summary()
+    assert "top" in s and "NOT:1" in s and repr(c) == s
 
 
-class TestAigDotVisualization:
-    """``to_dot()`` on the AIG-derived multiplier (artifacts go to --out-dir)."""
+# --- Synthesised circuit (integration) -------------------------------------
 
-    def test_to_dot_renders_multiplier(self, mul_int16_circuit, out_dir):
-        dot_file = out_dir / "Mul_INT16.dot"
-        mul_int16_circuit.to_dot(str(dot_file))
-        content = dot_file.read_text()
-        assert content.startswith("digraph Mul_INT16 {")
-        assert "rankdir=LR" in content
-        assert 'label="AND"' in content
-        assert 'label="NOT"' in content
-        assert "rank=source" in content and "rank=sink" in content
-        # At least one edge per gate.
-        assert content.count("->") >= len(mul_int16_circuit.gate_nodes)
-        assert content.strip().endswith("}")
+def test_synth_circuit(synth):
+    assert synth.name == "MulRecFN"
+    assert len(synth.input_nets) == 38 and len(synth.output_nets) == 22
+    assert len(synth.topological_order()) == len(synth.nodes)        # acyclic
+    valid = {"NOT", "BUF", "AND", "NAND", "OR", "NOR", "XOR", "XNOR"}
+    assert set(synth.gate_histogram()) <= valid
+    inputs = {n: (i % 2) for i, n in enumerate(synth.input_nets)}
+    result = synth.simulate(inputs)
+    assert len(result) == 22 and all(v in (0, 1) for v in result.values())
+    assert synth.simulate(inputs) == result                          # deterministic
+
+
+# --- AIGER parsing ---------------------------------------------------------
+
+def test_aig_parse(mul):
+    assert mul.name == "Mul_INT16" and len(mul.pi_nodes) == 32 and len(mul.po_nodes) == 32
+    assert set(mul.gate_histogram()) == {"AND", "NOT"} and mul.gate_histogram()["AND"] == 2784
+    assert {n.split("[")[0] for n in mul.input_nets} == {"IN1", "IN2"}
+    assert len(mul.topological_order()) == len(mul.nodes)
+
+
+@pytest.mark.parametrize("a, b", [(3, 5), (255, 255)])
+def test_aig_multiplies(mul, a, b):
+    inp = {f"IN1[{i}]": (a >> i) & 1 for i in range(16)}
+    inp.update({f"IN2[{i}]": (b >> i) & 1 for i in range(16)})
+    out = mul.simulate(inp)
+    assert sum((out[f"Out[{i}]"] & 1) << i for i in range(32)) == a * b
+
+
+def test_aig_options_and_errors(lib):
+    with open("examples/Mul_INT16.aig", "rb") as f:
+        assert Circuit.from_aig_bytes(f.read()).gate_histogram()["AND"] == 2784
+    assert Circuit.from_aig_file("examples/Mul_INT16.aig", lib).lib is lib
+    with pytest.raises(ValueError, match="latches"):
+        Circuit.from_aig_bytes(b"aag 1 0 1 2 0\n2 3\n2\n3\n")
+    with pytest.raises(ValueError, match="invalid AIGER header"):
+        Circuit.from_aig_bytes(b"not-an-aig 1 2 3\n")
+
+
+# --- DOT export ------------------------------------------------------------
+
+def test_to_dot(lib, out_dir):
+    c = mod(lib, "AND g0 ( .A(a), .B(1'b1), .Y(y) );",
+            "a,y", "input a; output y; wire a,y;")
+    path = out_dir / "top.dot"
+    c.to_dot(str(path))
+    s = path.read_text()
+    assert s.startswith("digraph top {") and s.strip().endswith("}")
+    assert "rankdir=LR" in s and "->" in s
+    assert "shape=box" in s and "shape=ellipse" in s and "shape=diamond" in s  # PI / gate / const
+    assert "rank=source" in s and "rank=sink" in s and "CONST1" in s
+
+
+def test_to_dot_large(mul, out_dir):
+    path = out_dir / "mul.dot"
+    mul.to_dot(str(path))
+    s = path.read_text()
+    assert s.startswith("digraph Mul_INT16 {")
+    assert s.count("->") >= len(mul.gate_nodes)

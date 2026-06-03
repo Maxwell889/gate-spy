@@ -10,55 +10,28 @@ def session():
     return CircuitSession()
 
 
-class TestLoad:
-    """Loading files of each supported kind into the session."""
-
-    def test_load_aiger(self, session):
-        info = session.load("examples/Mul_INT16.aig")
-        assert info["format"] == "aiger"
-        assert info["source"] == "examples/Mul_INT16.aig"
-        assert info["name"] == "Mul_INT16"
-        assert info["inputs"] == 32
-        assert info["outputs"] == 32
-        assert set(info["gate_histogram"]) <= {"AND", "NOT"}
-
-    def test_load_verilog_with_default_lib(self, session):
-        info = session.load("examples/Mul_F16_synth.v")
-        assert info["format"] == "verilog"
-        assert info["name"] == "MulRecFN"
-        assert info["gates"] > 0
-
-    def test_load_updates_current_circuit(self, session):
-        session.load("examples/Mul_INT16.aig")
-        assert session.circuit is not None
-        assert session.source == "examples/Mul_INT16.aig"
-
-    def test_missing_file_raises(self, session):
-        with pytest.raises(FileNotFoundError, match="no such file"):
-            session.load("examples/does_not_exist.aig")
-
-    def test_unsupported_extension_raises(self, session):
-        with pytest.raises(ValueError, match="unsupported file type"):
-            session.load("examples/example.lib")
+def test_load(session):
+    aiger = session.load("examples/Mul_INT16.aig")
+    assert "aiger" in aiger and "Mul_INT16" in aiger and "PIs=32" in aiger
+    assert session.circuit is not None and session.source == "examples/Mul_INT16.aig"
+    assert "MulRecFN" in session.load("examples/Mul_F16_synth.v")  # verilog + default lib
 
 
-class TestStats:
-    """The no-argument stats operation over session state."""
+def test_summary_and_extraction_stats(session):
+    session.load("examples/Mul_INT16.aig")
+    assert session.summary() == session.circuit.summary()
+    assert "longest chain" in session.xor_stats()
+    assert "largest tree" in session.adder_stats()
 
-    def test_stats_before_load_raises(self, session):
-        with pytest.raises(NoCircuitLoadedError, match="no circuit loaded"):
-            session.stats()
 
-    def test_stats_after_load(self, session):
-        session.load("examples/Mul_INT16.aig")
-        stats = session.stats()
-        assert stats["name"] == "Mul_INT16"
-        assert stats["source"] == "examples/Mul_INT16.aig"
-        assert stats["inputs"] == 32
+def test_requires_loaded_circuit(session):
+    for op in (session.summary, session.xor_stats, session.adder_stats):
+        with pytest.raises(NoCircuitLoadedError):
+            op()
 
-    def test_stats_match_load_payload(self, session):
-        loaded = session.load("examples/Mul_INT16.aig")
-        stats = session.stats()
-        # The circuit-level fields reported by load() and stats() agree.
-        for key in ("name", "inputs", "outputs", "gates", "nodes"):
-            assert loaded[key] == stats[key]
+
+def test_bad_paths(session):
+    with pytest.raises(FileNotFoundError):
+        session.load("examples/does_not_exist.aig")
+    with pytest.raises(ValueError, match="unsupported file type"):
+        session.load("examples/example.lib")
