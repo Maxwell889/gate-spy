@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import re
 import sys
+from pathlib import Path
 
 from ..library import Cell, Library, LogicFn
 from .node import Node, CONST0, CONST1, CONSTX, _CONST_KIND
 from .parser import parse as _parse_verilog
+from .aig_parser import parse_aig as _parse_aig, DEFAULT_LIB_PATH
 
 def _strip_meta(text: str) -> str:
     """Remove comments and ``(* ... *)`` attributes from Verilog source."""
@@ -79,6 +81,28 @@ class Circuit:
     def from_string(cls, text: str, lib: Library) -> Circuit:
         circuit = cls(lib)
         _parse_verilog(circuit, _strip_meta(text))
+        return circuit
+
+    @classmethod
+    def from_aig_file(cls, aig_path: str, lib: Library | None = None) -> Circuit:
+        """Parse an AIGER file (binary ``.aig`` or ASCII ``.aag``) into a Circuit.
+
+        *lib* defaults to ``examples/example.lib``; only its ``AND`` and ``NOT``
+        cells are used, since an AIG is built from those two primitives alone.
+        The circuit name is taken from the file stem.
+        """
+        with open(aig_path, "rb") as f:
+            circuit = cls.from_aig_bytes(f.read(), lib)
+        circuit.name = Path(aig_path).stem
+        return circuit
+
+    @classmethod
+    def from_aig_bytes(cls, data: bytes, lib: Library | None = None) -> Circuit:
+        """Parse raw AIGER bytes (binary or ASCII) into a Circuit."""
+        if lib is None:
+            lib = Library.from_file(str(DEFAULT_LIB_PATH))
+        circuit = cls(lib)
+        _parse_aig(circuit, data)
         return circuit
 
     def _add_node(self, kind: str, net: str = "", *, cell: Cell | None = None,

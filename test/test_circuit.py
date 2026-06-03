@@ -20,6 +20,15 @@ def synth_circuit(example_lib):
     return Circuit.from_file("examples/Mul_F16_synth.v", example_lib)
 
 
+@pytest.fixture
+def mul_int16_circuit():
+    """A 16x16->32 unsigned multiplier read from a binary AIGER file.
+
+    Built from AND/NOT only, using the default (example.lib) library.
+    """
+    return Circuit.from_aig_file("examples/Mul_INT16.aig")
+
+
 # ---------------------------------------------------------------------------
 # Circuit parsing — small hand-written cases
 # ---------------------------------------------------------------------------
@@ -368,7 +377,7 @@ class TestComplexVerilog:
 class TestDotVisualization:
     """``to_dot()`` generates valid Graphviz DOT for the circuit DAG."""
 
-    def test_to_dot_produces_valid_dot_format(self, example_lib, tmp_path):
+    def test_to_dot_produces_valid_dot_format(self, example_lib, out_dir):
         src = """
         module top(a, b, y);
           input a, b;
@@ -378,7 +387,7 @@ class TestDotVisualization:
         endmodule
         """
         c = Circuit.from_string(src, example_lib)
-        dot_file = tmp_path / "top.dot"
+        dot_file = out_dir / "top.dot"
         c.to_dot(str(dot_file))
         content = dot_file.read_text()
         assert content.startswith("digraph top {")
@@ -390,7 +399,7 @@ class TestDotVisualization:
         assert "->" in content              # edges present
         assert content.strip().endswith("}")
 
-    def test_to_dot_node_shapes_and_colors(self, example_lib, tmp_path):
+    def test_to_dot_node_shapes_and_colors(self, example_lib, out_dir):
         src = """
         module colors(a, y);
           input a;
@@ -400,7 +409,7 @@ class TestDotVisualization:
         endmodule
         """
         c = Circuit.from_string(src, example_lib)
-        dot_file = tmp_path / "colors.dot"
+        dot_file = out_dir / "colors.dot"
         c.to_dot(str(dot_file))
         content = dot_file.read_text()
         # PI: box shape, steel blue fill
@@ -412,7 +421,7 @@ class TestDotVisualization:
         # every ellipse node should have a fill colour
         assert 'fillcolor="#' in content
 
-    def test_to_dot_constants_use_diamond(self, example_lib, tmp_path):
+    def test_to_dot_constants_use_diamond(self, example_lib, out_dir):
         src = """
         module consts(a, y);
           input a;
@@ -422,14 +431,14 @@ class TestDotVisualization:
         endmodule
         """
         c = Circuit.from_string(src, example_lib)
-        dot_file = tmp_path / "consts.dot"
+        dot_file = out_dir / "consts.dot"
         c.to_dot(str(dot_file))
         content = dot_file.read_text()
         assert "shape=diamond" in content
         assert "CONST1" in content
 
-    def test_to_dot_on_synthesized_circuit(self, synth_circuit, tmp_path):
-        dot_file = tmp_path / "synth.dot"
+    def test_to_dot_on_synthesized_circuit(self, synth_circuit, out_dir):
+        dot_file = out_dir / "synth.dot"
         synth_circuit.to_dot(str(dot_file))
         content = dot_file.read_text()
         assert content.startswith("digraph MulRecFN {")
@@ -440,7 +449,7 @@ class TestDotVisualization:
         # At least as many edges as gate nodes
         assert content.count("->") >= len(synth_circuit.gate_nodes)
 
-    def test_to_dot_rank_constraints(self, example_lib, tmp_path):
+    def test_to_dot_rank_constraints(self, example_lib, out_dir):
         src = """
         module ranks(a, y);
           input a;
@@ -450,8 +459,89 @@ class TestDotVisualization:
         endmodule
         """
         c = Circuit.from_string(src, example_lib)
-        dot_file = tmp_path / "ranks.dot"
+        dot_file = out_dir / "ranks.dot"
         c.to_dot(str(dot_file))
         content = dot_file.read_text()
         assert "rank=source" in content
         assert "rank=sink" in content
+
+
+# ---------------------------------------------------------------------------
+# AIGER (.aig) parsing
+# ---------------------------------------------------------------------------
+
+def _set_word(base: str, value: int, width: int = 16) -> dict[str, int]:
+    """Drive a named LSB-first input word (``base[i]``) to *value*."""
+    return {f"{base}[{i}]": (value >> i) & 1 for i in range(width)}
+
+
+def _read_word(result: dict[str, int], base: str, width: int = 32) -> int:
+    """Read an LSB-first output word (``base[i]``) from a simulation result."""
+    return sum((result[f"{base}[{i}]"] & 1) << i for i in range(width))
+
+
+class TestAigParse:
+    """Reading the binary AIGER multiplier into a Circuit of AND/NOT gates."""
+
+    def test_parses_with_default_lib(self, mul_int16_circuit):
+        c = mul_int16_circuit
+        assert c.name == "Mul_INT16"
+        # aig 2816 32 0 32 2784 -> 32 inputs, 32 outputs, 2784 AND gates.
+        assert len(c.pi_nodes) == 32
+        assert len(c.po_nodes) == 32
+
+    def test_only_and_and_not_gates(self, mul_int16_circuit):
+        hist = mul_int16_circuit.gate_histogram()
+        assert set(hist) == {"AND", "NOT"}
+        assert hist["AND"] == 2784           # matches the header's AND count
+
+    def test_input_output_symbol_names(self, mul_int16_circuit):
+        c = mul_int16_circuit
+        assert set(n.split("[")[0] for n in c.input_nets) == {"IN1", "IN2"}
+        assert set(n.split("[")[0] for n in c.output_nets) == {"Out"}
+
+    def test_topological_order_is_acyclic(self, mul_int16_circuit):
+        order = mul_int16_circuit.topological_order()
+        assert len(order) == len(mul_int16_circuit.nodes)
+
+    @pytest.mark.parametrize("a, b", [(0, 0), (3, 5), (7, 9), (255, 255), (1234, 11)])
+    def test_multiplies_correctly(self, mul_int16_circuit, a, b):
+        inputs = {**_set_word("IN1", a), **_set_word("IN2", b)}
+        result = mul_int16_circuit.simulate(inputs)
+        assert _read_word(result, "Out") == a * b
+
+    def test_from_aig_bytes_matches_from_file(self, mul_int16_circuit):
+        with open("examples/Mul_INT16.aig", "rb") as f:
+            from_bytes = Circuit.from_aig_bytes(f.read())
+        assert from_bytes.gate_histogram() == mul_int16_circuit.gate_histogram()
+        assert from_bytes.input_nets == mul_int16_circuit.input_nets
+
+    def test_explicit_library_is_used(self, example_lib):
+        c = Circuit.from_aig_file("examples/Mul_INT16.aig", example_lib)
+        assert c.lib is example_lib
+
+    def test_latches_unsupported(self):
+        # The toggle flip-flop from the AIGER FORMAT doc (one latch).
+        with pytest.raises(ValueError, match="latches"):
+            Circuit.from_aig_bytes(b"aag 1 0 1 2 0\n2 3\n2\n3\n")
+
+    def test_invalid_header(self):
+        with pytest.raises(ValueError, match="invalid AIGER header"):
+            Circuit.from_aig_bytes(b"not-an-aig 1 2 3\n")
+
+
+class TestAigDotVisualization:
+    """``to_dot()`` on the AIG-derived multiplier (artifacts go to --out-dir)."""
+
+    def test_to_dot_renders_multiplier(self, mul_int16_circuit, out_dir):
+        dot_file = out_dir / "Mul_INT16.dot"
+        mul_int16_circuit.to_dot(str(dot_file))
+        content = dot_file.read_text()
+        assert content.startswith("digraph Mul_INT16 {")
+        assert "rankdir=LR" in content
+        assert 'label="AND"' in content
+        assert 'label="NOT"' in content
+        assert "rank=source" in content and "rank=sink" in content
+        # At least one edge per gate.
+        assert content.count("->") >= len(mul_int16_circuit.gate_nodes)
+        assert content.strip().endswith("}")
