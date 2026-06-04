@@ -32,7 +32,7 @@ def read_file(path: str) -> str:
 
 
 @mcp.tool()
-def get_node(node: str, depth: int = 2) -> str:
+def get_node(node: str, depth: int = 2, detail: bool = False) -> str:
     """Inspect a signal/node of the current circuit.
 
     ``node`` can be:
@@ -41,31 +41,49 @@ def get_node(node: str, depth: int = 2) -> str:
     - a numeric node id
 
     Returns the node's kind, basic info, and its fan-in / fan-out cones up to
-    ``depth`` levels (default 2).  Internal names are discovered by walking the
-    fan-in / fan-out of ports or other nodes — start from a port and follow the
-    names reported in each neighbour listing.
+    ``depth`` levels (default 2).  When ``detail`` is True, all neighbours are
+    listed; otherwise at most 16 per level (excess shown as "(+N more)").
     """
-    return session.node_info(node, depth)
+    return session.node_info(node, depth, detail=detail)
 
 
 @mcp.tool()
-def print_xor_stats() -> str:
+def extract_subgraph(inputs: list[str], outputs: list[str],
+                     out_path: str = "subgraph.v") -> str:
+    """Extract a closed subgraph between the given input/output signals.
+
+    ``inputs``/``outputs`` are lists of signal names (use port names from
+    ``read_file`` output or internal names discovered via ``get_node``).  The
+    subgraph is validated to be self-contained and written to ``out_path``.
+    The format is chosen by the file extension:
+
+    - ``.v`` (default) — structural Verilog with library cells
+    - ``.aig`` — binary AIGER, via ``scripts/v2aig.sh``
+
+    Returns a summary of the written circuit.
+    """
+    return session.extract_subcircuit(inputs, outputs, out_path)
+
+
+@mcp.tool()
+def print_xor_stats(detail: bool = False) -> str:
     """Extract XOR gates from the current circuit and report their chains.
 
     Reports the XOR count, the longest XOR chain (the signals it threads
-    through), and how XORs distribute by chain depth.
+    through).  The ``detail`` flag is accepted for API consistency.
     """
-    return session.xor_stats()
+    return session.xor_stats(detail=detail)
 
 
 @mcp.tool()
-def print_adder_stats() -> str:
+def print_adder_stats(detail: bool = False) -> str:
     """Extract half/full adders from the current circuit and report adder trees.
 
     Reports the HA/FA counts and the largest connected adder tree (its size,
-    composition, carry-depth, and the outputs it drives).
+    composition, carry-depth, and the outputs it drives).  With ``detail=True``,
+    all boundary signals are listed without truncation.
     """
-    return session.adder_stats()
+    return session.adder_stats(detail=detail)
 
 
 if __name__ == "__main__":

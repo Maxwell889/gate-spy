@@ -71,12 +71,17 @@ class XorCircuit:
     def summary(self) -> str:
         return f"XorCircuit({self.circuit.name}, xor={len(self.xors)})"
 
-    def report(self) -> str:
+    def report(self, detail: bool = False) -> str:
         if not self.xors:
             return f"No XOR gates found in {self.circuit.name}."
         chain = self.longest_chain()
         names = [self._name(r) for r in chain]
-        path = " -> ".join(names)
+        if not detail and len(names) > 16:
+            shown = " -> ".join(names[:16])
+            rest = len(names) - 16
+            path = f"{shown} -> (+{rest} more)"
+        else:
+            path = " -> ".join(names)
         return (
             f"XOR extraction on {self.circuit.name}\n"
             f"    XOR gates found : {len(self.xors)}\n"

@@ -76,6 +76,23 @@ def test_extraction_is_non_destructive(lib):
     assert c.simulate({"a": 1, "b": 1}) == {"s": 0, "c": 1}
 
 
+def test_subgraph_and_verilog_roundtrip(lib, out_dir):
+    c = build(lib, *FA)
+    from src.circuit.subgraph import extract_subgraph
+    from src.circuit.verilog_writer import write_verilog
+
+    sub = extract_subgraph(c, ["a", "b"], ["axb"])
+    p = out_dir / "sub.v"
+    write_verilog(sub, str(p))
+    c2 = Circuit.from_file(str(p), lib)
+    assert c2.simulate({"a": 1, "b": 1}) == {"axb": 0}
+    assert c2.simulate({"a": 0, "b": 1}) == {"axb": 1}
+
+    # boundary error
+    with pytest.raises(ValueError, match="outside the subgraph"):
+        extract_subgraph(c, ["a", "b"], ["co"])  # co needs cin too
+
+
 def test_to_dot(lib, out_dir):
     c = build(lib, *FA)
     path = out_dir / "fa.dot"

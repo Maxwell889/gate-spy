@@ -246,11 +246,14 @@ class Circuit:
                 fallback = nid
         return fallback
 
-    def describe_node(self, ref, depth: int = 2) -> str:
+    def describe_node(self, ref, depth: int = 2,
+                      detail: bool = False) -> str:
         """Human-/LLM-readable description of a node and its neighbourhood.
 
         *ref* is a node id or a signal name.  Reports the node's kind and basic
         info plus its fan-in and fan-out cones up to *depth* levels.
+        *depth* caps the traversal; *detail=True* shows all neighbours
+        (otherwise at most 16 per level).
         """
         nid = self._node_by_ref(ref)
         if nid is None:
@@ -272,15 +275,19 @@ class Circuit:
         lines.append(f"    fan-in  : {len(node.inputs)}")
         lines.append(f"    fan-out : {len(node.fanouts)}")
 
+        LIMIT = 16
+
         def walk(i: int, d: int, attr: str, indent: int, out: list[str]) -> None:
             if d == 0:
                 return
             neighbours = getattr(self.nodes[i], attr)
-            for j in neighbours[:8]:
+            shown = neighbours if detail else neighbours[:LIMIT]
+            for j in shown:
                 out.append("    " * indent + f"- {label(j)}")
                 walk(j, d - 1, attr, indent + 1, out)
-            if len(neighbours) > 8:
-                out.append("    " * indent + f"- (+{len(neighbours) - 8} more)")
+            if not detail and len(neighbours) > LIMIT:
+                out.append("    " * indent
+                           + f"- (+{len(neighbours) - LIMIT} more)")
 
         up: list[str] = []
         walk(nid, depth, "inputs", 1, up)

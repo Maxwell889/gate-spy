@@ -106,15 +106,6 @@ class AdderCircuit:
     def _name(self, nid: int) -> str:
         return self.circuit.nodes[nid].net or f"#{nid}"
 
-    def _signals(self, nids: list[int], limit: int = 12) -> str:
-        def natural(name: str):
-            return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
-
-        names = sorted((self._name(n) for n in nids), key=natural)
-        if len(names) <= limit:
-            return ", ".join(names) or "(none)"
-        return ", ".join(names[:limit]) + f", (+{len(names) - limit} more)"
-
     def _boundary(self, tree: list[Adder]) -> tuple[list[int], list[int]]:
         """Signals entering / leaving an adder tree (its operands and results)."""
         produced, nodes = set(), set()
@@ -140,13 +131,14 @@ class AdderCircuit:
         return (f"AdderCircuit({self.circuit.name}, "
                 f"HA={len(self.half_adders())}, FA={len(self.full_adders())})")
 
-    def report(self) -> str:
+    def report(self, detail: bool = False) -> str:
         if not self.adders:
             return f"No adders found in {self.circuit.name}."
         trees = self.trees()
         big = trees[0]
         fa = sum(1 for a in big if a.kind == "FA")
         inputs, results = self._boundary(big)
+        lim = None if detail else 12
         return "\n".join([
             f"Adder extraction on {self.circuit.name}",
             f"    adders found : {len(self.adders)} "
@@ -155,9 +147,18 @@ class AdderCircuit:
             f"    largest tree :",
             f"        adders     : {len(big)} ({fa} full, {len(big) - fa} half)",
             f"        carry depth: {self._depth(big)}",
-            f"        operands in ({len(inputs)}) : {self._signals(inputs)}",
-            f"        results out ({len(results)}): {self._signals(results)}",
+            f"        operands in ({len(inputs)}) : {self._signals(inputs, lim)}",
+            f"        results out ({len(results)}): {self._signals(results, lim)}",
         ])
+
+    def _signals(self, nids: list[int], limit: int | None = 12) -> str:
+        def natural(name: str):
+            return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+        names = sorted((self._name(n) for n in nids), key=natural)
+        if limit is None or len(names) <= limit:
+            return ", ".join(names) or "(none)"
+        return ", ".join(names[:limit]) + f", (+{len(names) - limit} more)"
 
     def __repr__(self) -> str:
         return self.summary()

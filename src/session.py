@@ -12,6 +12,8 @@ import os
 from .library import Library
 from .circuit import Circuit, extract_adders, extract_xor
 from .circuit.aig_parser import DEFAULT_LIB_PATH
+from .circuit.subgraph import extract_subgraph
+from .circuit.verilog_writer import write_verilog
 
 # File extensions we know how to parse.
 _VERILOG_EXTS = {".v", ".sv", ".verilog"}
@@ -119,14 +121,53 @@ class CircuitSession:
         """One-line summary of the current circuit, or raise if none is loaded."""
         return self._current().summary()
 
-    def xor_stats(self) -> str:
+    def xor_stats(self, detail: bool = False) -> str:
         """Extract XOR gates from the current circuit and report chain structure."""
-        return extract_xor(self._current()).report()
+        return extract_xor(self._current()).report(detail=detail)
 
-    def adder_stats(self) -> str:
+    def adder_stats(self, detail: bool = False) -> str:
         """Extract half/full adders and report the largest adder tree."""
-        return extract_adders(self._current()).report()
+        return extract_adders(self._current()).report(detail=detail)
 
-    def node_info(self, ref: str, depth: int = 2) -> str:
-        """Describe a node of the current circuit and its fan-in/out neighbourhood."""
-        return self._current().describe_node(ref, depth)
+    def node_info(self, ref: str, depth: int = 2, detail: bool = False) -> str:
+        return self._current().describe_node(ref, depth, detail=detail)
+
+    def extract_subcircuit(self, inputs: list[str], outputs: list[str],
+                           out_path: str = "subgraph.v") -> str:
+        """Extract a closed subgraph, write as Verilog (``.v``) or AIG (``.aig``).
+
+        The format is chosen by the file extension of *out_path*.  ``.aig``
+        output runs ``scripts/v2aig.sh`` as a post-processing step.
+        """
+        import os
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        sub = extract_subgraph(self._current(), inputs, outputs)
+        ext = os.path.splitext(out_path)[1].lower()
+
+        if ext == ".aig":
+            with tempfile.NamedTemporaryFile(suffix=".v", delete=False) as tf:
+                tf_v = tf.name
+            write_verilog(sub, tf_v)
+            script = Path(__file__).resolve().parents[1] / "scripts" / "v2aig.sh"
+            subprocess.run(
+                ["bash", str(script), tf_v, out_path,
+                 "-l", str(DEFAULT_LIB_PATH)],
+                check=True, capture_output=True, text=True,
+            )
+            os.unlink(tf_v)
+            aig_c = Circuit.from_aig_file(out_path)
+            return (
+                f"Subgraph extracted from {self.source}\n"
+                f"    written to  : {out_path}\n"
+                f"    {aig_c.summary()}"
+            )
+        else:
+            write_verilog(sub, out_path)
+            return (
+                f"Subgraph extracted from {self.source}\n"
+                f"    written to  : {out_path}\n"
+                f"    {sub.summary()}"
+            )
