@@ -149,14 +149,14 @@ class AdderCircuit:
         inputs, results = self._boundary(big)
         return "\n".join([
             f"Adder extraction on {self.circuit.name}",
-            f"  adders found : {len(self.adders)} "
+            f"    adders found : {len(self.adders)} "
             f"({len(self.full_adders())} full, {len(self.half_adders())} half)",
-            f"  adder trees  : {len(trees)} (groups linked by carry/sum signals)",
-            f"  largest tree :",
-            f"    adders     : {len(big)} ({fa} full, {len(big) - fa} half)",
-            f"    carry depth: {self._depth(big)}",
-            f"    operands in ({len(inputs)}) : {self._signals(inputs)}",
-            f"    results out ({len(results)}): {self._signals(results)}",
+            f"    adder trees  : {len(trees)} (groups linked by carry/sum signals)",
+            f"    largest tree :",
+            f"        adders     : {len(big)} ({fa} full, {len(big) - fa} half)",
+            f"        carry depth: {self._depth(big)}",
+            f"        operands in ({len(inputs)}) : {self._signals(inputs)}",
+            f"        results out ({len(results)}): {self._signals(results)}",
         ])
 
     def __repr__(self) -> str:

@@ -67,7 +67,46 @@ class CircuitSession:
 
         self.circuit = circuit
         self.source = path
-        return f"Loaded {fmt} file {path}\n{circuit.summary()}"
+        return self._load_report(fmt)
+
+    def _load_report(self, fmt: str) -> str:
+        c = self.circuit
+        assert c is not None
+
+        def compact(nets: list[str]) -> str:
+            import re
+            bus: dict[str, list[int]] = {}
+            scalars: list[str] = []
+            for n in nets:
+                m = re.match(r"(.+)\[(\d+)\]$", n)
+                if m:
+                    bus.setdefault(m.group(1), []).append(int(m.group(2)))
+                else:
+                    scalars.append(n)
+            parts = []
+            for b, idx in bus.items():
+                idx.sort()
+                parts.append(f"{b}[{idx[0]}..{idx[-1]}] ({len(idx)})")
+            parts.extend(scalars)
+            return ", ".join(parts) if parts else "(none)"
+
+        pi = compact(c.input_nets)
+        po = compact(c.output_nets)
+        verilog = fmt == "verilog"
+        naming = (
+            "    Internal signal names are Yosys-generated wires (e.g. _0001_) "
+            "from the netlist source."
+            if verilog else
+            "    Internal signal names are synthetic (e.g. n33 for AND gates, "
+            "n33_n for their inverters)."
+        )
+        return "\n".join([
+            f"Loaded {fmt} file {self.source}",
+            f"    {c.summary()}",
+            f"    Input ports ({len(c.input_nets)})  : {pi}",
+            f"    Output ports ({len(c.output_nets)}) : {po}",
+            naming,
+        ])
 
     def _current(self) -> Circuit:
         if self.circuit is None:
@@ -87,3 +126,7 @@ class CircuitSession:
     def adder_stats(self) -> str:
         """Extract half/full adders and report the largest adder tree."""
         return extract_adders(self._current()).report()
+
+    def node_info(self, ref: str, depth: int = 2) -> str:
+        """Describe a node of the current circuit and its fan-in/out neighbourhood."""
+        return self._current().describe_node(ref, depth)

@@ -86,6 +86,18 @@ def test_topology_and_summary(lib):
     assert "top" in s and "NOT:1" in s and repr(c) == s
 
 
+def test_describe_node(lib):
+    c = mod(lib, "AND g0 ( .A(a), .B(b), .Y(y) );",
+            "a,b,y", "input a,b; output y; wire a,b,y;")
+    text = c.describe_node("y")
+    assert "kind    : AND" in text and "function: (A * B)" in text
+    assert "a (PI)" in text and "b (PI)" in text   # fan-in cone
+    assert "y (PO)" in text                          # fan-out cone
+    assert c.describe_node(str(c.gate_nodes[0]))     # resolvable by id too
+    with pytest.raises(KeyError):
+        c.describe_node("nope")
+
+
 # --- Synthesised circuit (integration) -------------------------------------
 
 def test_synth_circuit(synth):

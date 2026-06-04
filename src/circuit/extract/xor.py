@@ -79,10 +79,10 @@ class XorCircuit:
         path = " -> ".join(names)
         return (
             f"XOR extraction on {self.circuit.name}\n"
-            f"  XOR gates found : {len(self.xors)}\n"
-            f"  longest chain   : {len(chain)} XORs deep "
+            f"    XOR gates found : {len(self.xors)}\n"
+            f"    longest chain   : {len(chain)} XORs deep "
             f"(a XOR feeding the next via a shared signal)\n"
-            f"  chain signals   :\n    {path}"
+            f"    chain signals   :\n        {path}"
         )
 
     def __repr__(self) -> str:

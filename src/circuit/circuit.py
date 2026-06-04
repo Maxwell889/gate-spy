@@ -226,6 +226,73 @@ class Circuit:
         return self.summary()
 
     # ------------------------------------------------------------------
+    # Node inspection
+    # ------------------------------------------------------------------
+
+    def _node_by_ref(self, ref) -> int | None:
+        """Resolve a node id or signal/net name to a node id.
+
+        A net drives one node, but its name is shared with the PO sink; the
+        producing (non-PO) node is preferred.
+        """
+        s = str(ref).strip()
+        if s.lstrip("-").isdigit() and int(s) in self.nodes:
+            return int(s)
+        fallback = None
+        for nid, node in self.nodes.items():
+            if node.net == s:
+                if not node.is_po:
+                    return nid
+                fallback = nid
+        return fallback
+
+    def describe_node(self, ref, depth: int = 2) -> str:
+        """Human-/LLM-readable description of a node and its neighbourhood.
+
+        *ref* is a node id or a signal name.  Reports the node's kind and basic
+        info plus its fan-in and fan-out cones up to *depth* levels.
+        """
+        nid = self._node_by_ref(ref)
+        if nid is None:
+            raise KeyError(f"no node matching {ref!r}")
+        node = self.nodes[nid]
+
+        def label(i: int) -> str:
+            n = self.nodes[i]
+            return f"{n.net or f'#{i}'} ({n.kind})"
+
+        lines = [
+            f"Node {label(nid)}",
+            f"    id      : {nid}",
+            f"    kind    : {node.kind}",
+            f"    net     : {node.net or '(unnamed)'}",
+        ]
+        if node.cell is not None:
+            lines.append(f"    function: {node.cell.function}")
+        lines.append(f"    fan-in  : {len(node.inputs)}")
+        lines.append(f"    fan-out : {len(node.fanouts)}")
+
+        def walk(i: int, d: int, attr: str, indent: int, out: list[str]) -> None:
+            if d == 0:
+                return
+            neighbours = getattr(self.nodes[i], attr)
+            for j in neighbours[:8]:
+                out.append("    " * indent + f"- {label(j)}")
+                walk(j, d - 1, attr, indent + 1, out)
+            if len(neighbours) > 8:
+                out.append("    " * indent + f"- (+{len(neighbours) - 8} more)")
+
+        up: list[str] = []
+        walk(nid, depth, "inputs", 1, up)
+        down: list[str] = []
+        walk(nid, depth, "fanouts", 1, down)
+        lines.append(f"\n    fan-in cone (up to {depth} levels):")
+        lines += up or ["        (none - primary input or constant)"]
+        lines.append(f"\n    fan-out cone (up to {depth} levels):")
+        lines += down or ["        (none - primary output)"]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # DOT / Graphviz export
     # ------------------------------------------------------------------
 
