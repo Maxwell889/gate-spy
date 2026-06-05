@@ -202,7 +202,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gate-lifter"
+name = "gate-spy"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,5 +1,5 @@
 [project]
-name = "gate-lifter"
+name = "gate-spy"
 version = "0.1.0"
 description = "An LLM-agent-based framework for reasoning over gate-level netlists"
 requires-python = ">=3.11"

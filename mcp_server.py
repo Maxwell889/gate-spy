@@ -9,7 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from src.session import CircuitSession
 
-mcp = FastMCP("gate-lifter")
+mcp = FastMCP("gate-spy")
 session = CircuitSession()
 
 
