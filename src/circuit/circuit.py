@@ -316,6 +316,123 @@ class Circuit:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # Cone traversal
+    # ------------------------------------------------------------------
+
+    def find_cone(self, signals: list[str], direction: str,
+                  stop_at: list[str] | None = None,
+                  depth: int = -1) -> dict:
+        """BFS from *signals* through fan-in (``backward``) or fan-out
+        (``forward``), returning layer-by-layer structured data.
+
+        Traversal stops at nodes matched by *stop_at* (included but not
+        expanded) or when *depth* levels have been visited (0 = start
+        signals only; -1 = unlimited).
+
+        Returns a dict with:
+        - ``ok`` (bool), ``direction`` (str)
+        - ``start``: resolved node ids for the start signals
+        - ``stop``: resolved node ids for the stop_at signals (if any)
+        - ``layers``: list of ``{depth, node_ids, count}``, one per level
+        - ``boundary``: leaf nodes broken down by why traversal stopped
+        - ``total_nodes``: total internal nodes visited (excludes start)
+        - ``truncated``: whether the depth cap was hit
+        """
+        if direction not in ("backward", "forward"):
+            raise ValueError(
+                f"direction must be 'backward' or 'forward', got {direction!r}")
+
+        start_ids = [self._node_by_ref(s) for s in signals]
+        bad = [s for s, n in zip(signals, start_ids) if n is None]
+        if bad:
+            raise KeyError(f"unresolved signal(s) in 'signals': {bad}")
+
+        stop_at = stop_at or []
+        stop_ids: set[int] = set()
+        for s in stop_at:
+            n = self._node_by_ref(s)
+            if n is None:
+                raise KeyError(f"unresolved signal in 'stop_at': {s!r}")
+            stop_ids.add(n)
+
+        # Determine the neighbour direction
+        if direction == "backward":
+            def neighbours(nid: int) -> list[int]:
+                return self.nodes[nid].inputs
+        else:
+            def neighbours(nid: int) -> list[int]:
+                return self.nodes[nid].fanouts
+
+        # BFS: (node_id, distance_from_start)
+        # layer 0 = the start signals themselves (not counted in total_nodes)
+        visited: dict[int, int] = {}   # node_id -> distance
+        frontier: list[int] = list(start_ids)
+        for sid in start_ids:
+            visited[sid] = 0
+
+        layers_raw: dict[int, list[int]] = {}  # distance -> nodes (excludes layer 0)
+        stop_hit: list[int] = []                # nodes where we hit stop_at
+        pi_hit: list[int] = []                  # PI/PO nodes hit
+
+        while frontier:
+            cur = frontier.pop(0)
+            cur_dist = visited[cur]
+
+            # Check if this node is a stop condition (only for non-start nodes)
+            if cur not in set(start_ids):
+                node = self.nodes[cur]
+                if node.is_pi or node.is_po:
+                    pi_hit.append(cur)
+                    continue
+                if cur in stop_ids:
+                    stop_hit.append(cur)
+                    continue
+
+            # Depth cap
+            if depth >= 0 and cur_dist >= depth:
+                continue
+
+            for nb in neighbours(cur):
+                if nb not in visited:
+                    nb_dist = cur_dist + 1
+                    visited[nb] = nb_dist
+                    frontier.append(nb)
+                    # Track layers (exclude start layer)
+                    layers_raw.setdefault(nb_dist, []).append(nb)
+
+        # Build ordered layer list
+        layers: list[dict] = []
+        for d in sorted(layers_raw.keys()):
+            node_ids = layers_raw[d]
+            layers.append({"depth": d, "node_ids": node_ids, "count": len(node_ids)})
+
+        # Total internal nodes (excludes layer 0 start signals)
+        total = sum(l["count"] for l in layers)
+
+        # Boundary signals: group by reason
+        boundary: dict[str, list[int]] = {}
+        if pi_hit:
+            boundary["pi_po"] = pi_hit
+        if stop_hit:
+            boundary["stop_at"] = stop_hit
+
+        truncated = depth >= 0 and any(
+            d >= depth for d in layers_raw.keys()
+        )
+
+        return {
+            "ok": True,
+            "direction": direction,
+            "start": start_ids,
+            "stop": sorted(stop_ids),
+            "depth_cap": depth,
+            "layers": layers,
+            "boundary": boundary,
+            "total_nodes": total,
+            "truncated": truncated,
+        }
+
+    # ------------------------------------------------------------------
     # DOT / Graphviz export
     # ------------------------------------------------------------------
 

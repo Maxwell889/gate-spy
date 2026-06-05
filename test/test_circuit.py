@@ -159,3 +159,66 @@ def test_to_dot_large(mul, out_dir):
     s = path.read_text()
     assert s.startswith("digraph Mul_INT16 {")
     assert s.count("->") >= len(mul.gate_nodes)
+
+
+# --- find_cone --------------------------------------------------------------
+
+def test_find_cone_backward_basic(lib):
+    c = mod(lib, "AND g0 ( .A(a), .B(b), .Y(y) );", "a,b,y",
+            "input a,b; output y; wire a,b,y;")
+    data = c.find_cone(["y"], "backward")
+    assert data["ok"]
+    assert data["direction"] == "backward"
+    assert len(data["boundary"].get("pi_po", [])) == 2  # a, b
+    # a and b should be at some layer
+    boundary_pis = {c.nodes[nid].net for nid in data["boundary"]["pi_po"]}
+    assert boundary_pis == {"a", "b"}
+
+
+def test_find_cone_forward_basic(lib):
+    c = mod(lib, "AND g0 ( .A(a), .B(b), .Y(y) );", "a,b,y",
+            "input a,b; output y; wire a,b,y;")
+    data = c.find_cone(["a"], "forward")
+    assert data["direction"] == "forward"
+    # a fans out to g0, g0 fans out to y
+    po_boundary = data["boundary"].get("pi_po", [])
+    assert len(po_boundary) >= 1
+
+
+def test_find_cone_depth_limit(lib):
+    c = mod(lib, "AND g1 ( .A(a), .B(b), .Y(m) ); AND g2 ( .A(m), .B(c), .Y(y) );",
+            "a,b,c,y", "input a,b,c; output y; wire a,b,c,m,y;")
+    data = c.find_cone(["y"], "backward", depth=1)
+    # depth=1 should not reach PIs (need depth=2 for m, depth=3 for a,b,c)
+    assert data["truncated"]
+    assert len(data["boundary"].get("pi_po", [])) < 3  # shouldn't reach all PIs
+
+
+def test_find_cone_stop_at(lib):
+    c = mod(lib, "AND g1 ( .A(a), .B(b), .Y(m) ); AND g2 ( .A(m), .B(c), .Y(y) );",
+            "a,b,c,y", "input a,b,c; output y; wire a,b,c,m,y;")
+    data = c.find_cone(["y"], "backward", stop_at=["m"])
+    assert "stop_at" in data["boundary"]
+    stop_nets = {c.nodes[nid].net for nid in data["boundary"]["stop_at"]}
+    assert stop_nets == {"m"}
+
+
+def test_find_cone_invalid_errors(lib):
+    c = mod(lib, "AND g0 ( .A(a), .B(b), .Y(y) );", "a,b,y",
+            "input a,b; output y; wire a,b,y;")
+    with pytest.raises(KeyError, match="unresolved"):
+        c.find_cone(["z"], "backward")
+    with pytest.raises(ValueError, match="direction"):
+        c.find_cone(["y"], "up")
+    with pytest.raises(KeyError, match="unresolved.*stop_at"):
+        c.find_cone(["y"], "backward", stop_at=["z"])
+
+
+def test_find_cone_synthetic_names(synth):
+    """find_cone works on Verilog circuits with Yosys _0001_ internal names."""
+    # The 36 adder-tree results are internal signals in Mul_F16_synth.v
+    data = synth.find_cone(["_1514_", "_1517_", "_1539_"], "backward", depth=3)
+    assert data["ok"]
+    assert len(data["layers"]) >= 1
+    # Should find some PIs among the transitive fan-in
+    assert len(data["boundary"].get("pi_po", [])) > 0

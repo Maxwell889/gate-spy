@@ -439,6 +439,155 @@ class CircuitSession:
             raise KeyError(f"no signal matching {ref!r} in the current circuit")
         return fields
 
+    def cone_report(self, signals: list[str], direction: str,
+                    stop_at: list[str] | None = None,
+                    depth: int = -1,
+                    detail: bool = False) -> str:
+        """Report the forward or backward cone of *signals* in structured layers.
+
+        Args:
+            signals: starting signal names (nets, node ids, or port names).
+            direction: ``"backward"`` (trace fan-in) or ``"forward"`` (trace fan-out).
+            stop_at: optional signal names where traversal halts (included but not
+                expanded further).
+            depth: maximum levels to traverse (-1 = unlimited).  Layer 0 is the
+                start signals themselves.
+            detail: when True, lists every node at every layer; otherwise caps
+                each layer at 16 entries with an overflow note.
+
+        Returns:
+            A multiline text report structured for LLM comprehension: header,
+            per-layer listings, boundary-signal breakdown, and a summary.
+        """
+        c = self._current()
+        data = c.find_cone(signals, direction, stop_at=stop_at, depth=depth)
+
+        LIMIT = 16
+
+        def _label(nid: int) -> str:
+            n = c.nodes[nid]
+            net = n.net or f"#{nid}"
+            return f"{net} ({n.kind})"
+
+        def _compact_nets(nids: list[int]) -> str:
+            """Group nets like ``io_a[0..10] (11)`` for readability."""
+            bus: dict[str, list[int]] = {}
+            scalars: list[str] = []
+            for nid in nids:
+                net = c.nodes[nid].net or ""
+                m = re.match(r"(.+)\[(\d+)\]$", net)
+                if m:
+                    bus.setdefault(m.group(1), []).append(int(m.group(2)))
+                else:
+                    scalars.append(net)
+            parts: list[str] = []
+            for b, idx in sorted(bus.items()):
+                idx.sort()
+                parts.append(f"{b}[{idx[0]}..{idx[-1]}] ({len(idx)})")
+            parts.extend(sorted(scalars))
+            return ", ".join(parts) if parts else "(none)"
+
+        # -- header -------------------------------------------------------
+        start_names = [c.nodes[i].net or c.nodes[i].kind for i in data["start"]]
+        start_list = ", ".join(start_names[:8])
+        if len(start_names) > 8:
+            start_list += f", ... (+{len(start_names) - 8} more)"
+
+        lines = [
+            f"Cone traversal report — {self.source}",
+            f"    direction  : {data['direction']}",
+            f"    start from : {start_list} ({len(data['start'])} signals)",
+        ]
+        if stop_at:
+            stop_names = [c.nodes[i].net or c.nodes[i].kind for i in data["stop"]]
+            lines.append(
+                f"    stop at    : {', '.join(stop_names[:8])}"
+                + (f", ... (+{len(stop_names) - 8} more)"
+                   if len(stop_names) > 8 else "")
+                + f" ({len(data['stop'])} signals)"
+            )
+        else:
+            direction_stop = "PIs" if direction == "backward" else "POs"
+            lines.append(
+                f"    stop at    : (none — trace until {direction_stop})"
+            )
+        cap_str = str(depth) if depth >= 0 else "unlimited"
+        lines.append(f"    depth cap  : {cap_str}")
+        lines.append("")
+
+        # -- layers -------------------------------------------------------
+        for layer in data["layers"]:
+            d = layer["depth"]
+            nids = layer["node_ids"]
+            shown = nids if detail else nids[:LIMIT]
+            lines.append(
+                f"== Layer {d} (distance {d}) — {layer['count']} signals =="
+            )
+            for nid in shown:
+                node = c.nodes[nid]
+                fin = f"fanin={len(node.inputs)}"
+                fout = f"fanout={len(node.fanouts)}"
+                lines.append(
+                    f"  {_label(nid):<36s}  ► {fin:<10s}  ◄ {fout}"
+                )
+            if not detail and len(nids) > LIMIT:
+                lines.append(
+                    f"  (+{len(nids) - LIMIT} more — use detail=True for full list)"
+                )
+            lines.append("")
+
+        if not data["layers"]:
+            lines.append("== (no internal layers traversed) ==\n")
+
+        # -- boundary -----------------------------------------------------
+        bdry = data["boundary"]
+        if bdry:
+            lines.append("== Boundary signals ==")
+            for kind, nids in bdry.items():
+                if kind == "pi_po":
+                    label = "primary inputs" if direction == "backward" else "primary outputs"
+                    lines.append(f"  Reached {label} ({len(nids)}):")
+                elif kind == "stop_at":
+                    lines.append(f"  Reached stop_at ({len(nids)}):")
+                shown = nids if detail else nids[:LIMIT]
+                for nid in shown:
+                    node = c.nodes[nid]
+                    fin = f"fanin={len(node.inputs)}"
+                    fout = f"fanout={len(node.fanouts)}"
+                    lines.append(
+                        f"    {_label(nid):<34s}  ► {fin:<10s}  ◄ {fout}"
+                    )
+                if not detail and len(nids) > LIMIT:
+                    lines.append(
+                        f"    (+{len(nids) - LIMIT} more)"
+                    )
+                # Compact ranges
+                lines.append(f"    Compact  : {_compact_nets(nids)}")
+            lines.append("")
+
+        # -- summary ------------------------------------------------------
+        if data["truncated"]:
+            lines.append(f"== ⚠ Depth cap ({depth} levels) reached — cone may extend further ==")
+        lines.append(f"== Summary ==")
+
+        total = data["total_nodes"]
+        nlayers = len(data["layers"])
+        nboundary = sum(len(v) for v in bdry.values())
+        lines.append(
+            f"  Traversed {nlayers} layers, {total} internal nodes, "
+            f"{nboundary} boundary signals."
+        )
+
+        if bdry:
+            for kind, nids in bdry.items():
+                if kind == "pi_po":
+                    label = "primary inputs" if direction == "backward" else "primary outputs"
+                elif kind == "stop_at":
+                    label = "stop_at"
+                lines.append(f"  {label}: {_compact_nets(nids)}")
+
+        return "\n".join(lines)
+
     def extract_subcircuit(self, inputs: list[str], outputs: list[str],
                            out_path: str = "subgraph.v") -> str:
         """Extract a closed subgraph, write as Verilog (``.v``) or AIG (``.aig``).

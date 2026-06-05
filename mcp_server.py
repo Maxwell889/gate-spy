@@ -66,6 +66,41 @@ def extract_subgraph(inputs: list[str], outputs: list[str],
 
 
 @mcp.tool()
+def find_cone(signals: list[str],
+              direction: str,
+              stop_at: list[str] | None = None,
+              depth: int = -1,
+              detail: bool = False) -> str:
+    """Trace the fan-in (``backward``) or fan-out (``forward``) cone of a set of
+    starting signals, returning the cone layer-by-layer.
+
+    Use this to discover the boundary of a sub-circuit:
+
+    - ``direction="backward"`` traces **upstream** (fan-in / inputs) to find
+      which primary inputs (or ``stop_at`` signals) a set of signals depends on.
+      Example: given 36 adder-tree result signals, ``backward`` tells you those
+      results ultimately depend on ``io_a[0:10], io_b[0:10]`` — the mantissa bits.
+    - ``direction="forward"`` traces **downstream** (fan-out) to find where a
+      set of signals converges, e.g. which product-bit signals emerge before
+      normalisation logic.
+
+    ``stop_at`` is a list of signal names where traversal halts — the signals
+    are included in the report but not expanded further.  This lets you "clip"
+    the cone at a known boundary (e.g. the normalisation shifter inputs).
+
+    ``depth`` caps the number of levels (0 = start signals only, -1 = unlimited).
+    ``detail=True`` lists every node at every layer; otherwise each layer is
+    capped at 16 entries with an overflow count.
+
+    Returns a structured, layer-by-layer report: a header with parameters, one
+    section per distance level, a boundary-signal breakdown grouped by *why*
+    traversal stopped, and a compact summary with bus ranges.
+    """
+    return session.cone_report(signals, direction, stop_at=stop_at,
+                               depth=depth, detail=detail)
+
+
+@mcp.tool()
 def simulate(pattern_num: int = 100,
              fixed_inputs: dict[str, int] | None = None,
              watch: list[str] | None = None,
