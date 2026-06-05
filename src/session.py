@@ -8,6 +8,8 @@ returns plain dicts, so any frontend (MCP, CLI, HTTP) can sit on top.
 from __future__ import annotations
 
 import os
+import random
+import re
 
 from .library import Library
 from .circuit import Circuit, extract_adders, extract_xor
@@ -18,6 +20,118 @@ from .circuit.verilog_writer import write_verilog
 # File extensions we know how to parse.
 _VERILOG_EXTS = {".v", ".sv", ".verilog"}
 _AIGER_EXTS = {".aig", ".aag"}
+
+# Matches a bit-slice net name like ``IN1[3]`` -> ("IN1", 3).
+_BIT_RE = re.compile(r"^(.*)\[(\d+)\]$")
+
+# Upper bound on random patterns per call, to keep a runaway request bounded.
+_MAX_PATTERNS = 100_000
+
+
+def _split_bit(net: str) -> tuple[str, int | None]:
+    """Split ``base[idx]`` into ``(base, idx)``; scalars give ``(net, None)``."""
+    m = _BIT_RE.match(net)
+    if m:
+        return m.group(1), int(m.group(2))
+    return net, None
+
+
+def _bus_fields(nets: list[str], net_to_node: dict[str, int]) -> list[dict]:
+    """Group a net list into display fields (one per bus / scalar).
+
+    Preserves first-appearance order of bus bases.  Each field carries the
+    ``(bit_index, node_id)`` pairs needed to reconstruct an integer value.
+    """
+    order: list[str] = []
+    buses: dict[str, list[tuple[int, int, str]]] = {}
+    scalars: set[str] = set()
+    for net in nets:
+        base, i = _split_bit(net)
+        if base not in buses:
+            order.append(base)
+            buses[base] = []
+        if i is None:
+            scalars.add(base)
+            buses[base].append((0, net_to_node[net], net))
+        else:
+            buses[base].append((i, net_to_node[net], net))
+
+    fields: list[dict] = []
+    for base in order:
+        triples = sorted(buses[base])
+        width = 1 if base in scalars else (triples[-1][0] + 1)
+        fields.append({
+            "label": base, "group": "io", "width": width,
+            "bits": [(idx, nid) for idx, nid, _ in triples],
+            "nets": [net for _, _, net in triples],
+        })
+    return fields
+
+
+def _field_value(field: dict, value: dict[int, int]) -> int:
+    """Reconstruct a field's integer value from per-node bit values."""
+    return sum((value[nid] & 1) << idx for idx, nid in field["bits"])
+
+
+def _input_drive(in_fields: list[dict],
+                 fixed_bits: dict[str, int]) -> tuple[str, list[str]]:
+    """Describe how each input bus is driven this run.
+
+    Returns ``(summary, partial_bases)`` where *summary* annotates every input
+    bus as ``= <value>`` (fully pinned), ``partial (k/w bits fixed)`` or
+    ``random``, and *partial_bases* lists the bases that are only partially
+    constrained — those warrant an explicit NOTE so the caller is not misled
+    into reading their columns as a chosen value.
+    """
+    if not in_fields:
+        return "(none)", []
+    parts: list[str] = []
+    partials: list[str] = []
+    for f in in_fields:
+        nets, label, width = f["nets"], f["label"], f["width"]
+        fixed_idx = [(idx, fixed_bits[net])
+                     for (idx, _), net in zip(f["bits"], nets)
+                     if net in fixed_bits]
+        if not fixed_idx:
+            parts.append(f"{label}[{width}] random")
+        elif len(fixed_idx) == len(nets):
+            val = sum(bit << idx for idx, bit in fixed_idx)
+            parts.append(f"{label}[{width}] = {val}")
+        else:
+            parts.append(
+                f"{label}[{width}] partial ({len(fixed_idx)}/{len(nets)} fixed)")
+            partials.append(label)
+    return ", ".join(parts), partials
+
+
+def _field_summary(fields: list[dict]) -> str:
+    """One-line ``base[width]`` listing for a group of fields."""
+    if not fields:
+        return "(none)"
+    return ", ".join(
+        f"{f['label']}[{f['width']}]" if "width" in f else f["label"]
+        for f in fields
+    )
+
+
+def _render_table(cols: list[dict], n: int) -> str:
+    """Render aligned, group-separated columns into a fixed-width table."""
+    widths = [max(len(c["label"]), *(len(v) for v in c["values"]), 1)
+              for c in cols]
+
+    def line(cells: list[str]) -> str:
+        parts: list[str] = []
+        prev: str | None = None
+        for col, w, cell in zip(cols, widths, cells):
+            if prev is not None and col["group"] != prev:
+                parts.append("|")
+            parts.append(cell.rjust(w))
+            prev = col["group"]
+        return "  ".join(parts)
+
+    header = line([c["label"] for c in cols])
+    body = [line([c["values"][k] for c in cols]) for k in range(n)]
+    return "\n".join([header, "-" * len(header), *body])
 
 
 class NoCircuitLoadedError(RuntimeError):
@@ -131,6 +245,199 @@ class CircuitSession:
 
     def node_info(self, ref: str, depth: int = 2, detail: bool = False) -> str:
         return self._current().describe_node(ref, depth, detail=detail)
+
+    # -- simulation -----------------------------------------------------
+
+    def simulate(self, pattern_num: int = 100,
+                 fixed_inputs: dict[str, int] | None = None,
+                 watch: list[str] | None = None,
+                 seed: int | None = None) -> str:
+        """Simulate the current circuit and report bus values across patterns.
+
+        Args:
+            pattern_num: number of random input patterns to apply (default 100).
+                Ignored (forced to 1) when *fixed_inputs* pins every input bit.
+            fixed_inputs: input values to hold constant across all patterns.
+                Keys may be a bus base (``"IN1"`` -> integer spread MSB..LSB over
+                its bits), a single bit (``"IN1[0]"``), or a scalar port. Bits
+                not pinned here are randomised each pattern.
+            watch: extra internal signals to include in the report. Each entry
+                is a single net (``"_0007_"``, ``"n33"``) shown as its raw bit,
+                or an internal bus base (``"sum"``) whose bits are gathered into
+                an integer.
+            seed: optional RNG seed for reproducible random patterns.
+
+        Returns:
+            A text report: one row per pattern with each input/output bus (and
+            any watched signal) rendered as a decimal integer. The header
+            annotates each input bus as fixed/partial/random; partially
+            constrained buses get an explicit NOTE.
+
+        Raises:
+            ValueError: for an unknown input name, a bit value other than 0/1,
+                a bus value that overflows its width, or an out-of-bounds
+                ``pattern_num``. The message names the offending input and the
+                allowed range so the caller can correct the request.
+        """
+        c = self._current()
+
+        # net -> driver node id (prefer the producing node over the PO sink).
+        net_to_node: dict[str, int] = {}
+        for nid, node in c.nodes.items():
+            if not node.net:
+                continue
+            if node.net not in net_to_node or not node.is_po:
+                net_to_node[node.net] = nid
+
+        pi_nets = c.input_nets
+        fixed_bits = self._expand_fixed(fixed_inputs or {}, pi_nets)
+        all_fixed = len(fixed_bits) == len(pi_nets)
+
+        if pattern_num < 1:
+            raise ValueError(f"pattern_num must be >= 1 (got {pattern_num})")
+        if pattern_num > _MAX_PATTERNS:
+            raise ValueError(
+                f"pattern_num {pattern_num} exceeds the cap of {_MAX_PATTERNS}; "
+                f"request fewer patterns")
+        n = 1 if all_fixed else pattern_num
+
+        in_fields = _bus_fields(pi_nets, net_to_node)
+        out_fields = _bus_fields(c.output_nets, net_to_node)
+        watch_fields = self._watch_fields(watch or [], net_to_node)
+
+        rng = random.Random(seed)
+        idx_col = {"label": "#", "group": "idx", "values": []}
+        for field in in_fields + out_fields + watch_fields:
+            field["values"] = []
+
+        for k in range(n):
+            inp = {net: (fixed_bits[net] if net in fixed_bits else rng.randint(0, 1))
+                   for net in pi_nets}
+            value = c.simulate_values(inp)
+            idx_col["values"].append(str(k))
+            for field in in_fields + out_fields + watch_fields:
+                field["values"].append(str(_field_value(field, value)))
+
+        # Per-bus drive status (fixed value / partial / random) + overall mode.
+        in_desc, partials = _input_drive(in_fields, fixed_bits)
+        if all_fixed:
+            mode = "fixed"
+        elif partials or fixed_bits:
+            mode = "random (partial constraints)"
+        else:
+            mode = "random"
+
+        cols = [idx_col] + in_fields + out_fields + watch_fields
+        lines = [
+            f"Simulation report — {self.source}",
+            f"    patterns : {n} ({mode})",
+            f"    inputs   : {in_desc}",
+            f"    outputs  : {_field_summary(out_fields)}",
+        ]
+        if watch_fields:
+            lines.append(f"    watch    : {_field_summary(watch_fields)}")
+        if seed is not None and not all_fixed:
+            lines.append(f"    seed     : {seed}")
+        for base in partials:
+            lines.append(
+                f"    NOTE: input bus {base!r} is only partially constrained — "
+                f"its unspecified bits are randomised on every pattern.")
+        lines.append("")
+        lines.append(_render_table(cols, n))
+        return "\n".join(lines)
+
+    def _expand_fixed(self, fixed: dict[str, int],
+                      pi_nets: list[str]) -> dict[str, int]:
+        """Expand ``fixed`` (bus/bit/scalar keys) into a net -> bit map.
+
+        Validates every key and value, raising :class:`ValueError` with an
+        actionable message rather than silently masking or truncating: unknown
+        signals, non-0/1 bit values, and bus integers that overflow the bus
+        width are all rejected.
+        """
+        pi_set = set(pi_nets)
+        buses: dict[str, dict[int, str]] = {}     # bus base -> {idx: net}
+        scalars: list[str] = []
+        for net in pi_nets:
+            base, i = _split_bit(net)
+            if i is None:
+                scalars.append(net)
+            else:
+                buses.setdefault(base, {})[i] = net
+
+        bits: dict[str, int] = {}
+        for key, raw in fixed.items():
+            try:
+                val = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"value {raw!r} for input {key!r} is not an integer")
+            base, i = _split_bit(key)
+
+            if i is not None:                       # explicit single bit
+                if key not in pi_set:
+                    raise ValueError(self._unknown_input_msg(key, buses, scalars))
+                if val not in (0, 1):
+                    raise ValueError(
+                        f"value {val} for input bit {key!r} is not a single bit "
+                        f"(allowed 0 or 1)")
+                bits[key] = val
+            elif key in pi_set:                     # scalar primary input
+                if val not in (0, 1):
+                    raise ValueError(
+                        f"value {val} for scalar input {key!r} is not a single "
+                        f"bit (allowed 0 or 1)")
+                bits[key] = val
+            elif key in buses:                      # bus base -> spread integer
+                width = max(buses[key]) + 1
+                hi = (1 << width) - 1
+                if not (0 <= val <= hi):
+                    raise ValueError(
+                        f"value {val} for input bus {key!r} is out of range for "
+                        f"its {width}-bit width (allowed 0..{hi})")
+                for idx, net in buses[key].items():
+                    bits[net] = (val >> idx) & 1
+            else:
+                raise ValueError(self._unknown_input_msg(key, buses, scalars))
+        return bits
+
+    @staticmethod
+    def _unknown_input_msg(key: str, buses: dict[str, dict[int, str]],
+                           scalars: list[str]) -> str:
+        """Build an actionable 'unknown input' error listing the real inputs."""
+        bus_list = ", ".join(f"{b}[{max(idx) + 1}]"
+                             for b, idx in buses.items()) or "(none)"
+        msg = (f"{key!r} is not a primary input of this circuit. "
+               f"Available input buses: {bus_list}.")
+        if scalars:
+            msg += f" Scalar inputs: {', '.join(scalars)}."
+        msg += (" Use a bus base (e.g. 'IN1') for a word value, or a single bit "
+                "(e.g. 'IN1[0]').")
+        return msg
+
+    def _watch_fields(self, refs: list[str],
+                      net_to_node: dict[str, int]) -> list[dict]:
+        """Resolve watch refs (single nets or internal bus bases) to fields."""
+        fields: list[dict] = []
+        for ref in refs:
+            _, i = _split_bit(ref)
+            if ref in net_to_node:                  # single named net / bit
+                fields.append({"label": ref, "group": "watch",
+                               "bits": [(0, net_to_node[ref])]})
+                continue
+            if i is None:                           # maybe an internal bus base
+                bits = {}
+                for net, nid in net_to_node.items():
+                    b, j = _split_bit(net)
+                    if b == ref and j is not None:
+                        bits[j] = nid
+                if bits:
+                    fields.append({"label": ref, "group": "watch",
+                                   "bits": sorted(bits.items()),
+                                   "width": max(bits) + 1})
+                    continue
+            raise KeyError(f"no signal matching {ref!r} in the current circuit")
+        return fields
 
     def extract_subcircuit(self, inputs: list[str], outputs: list[str],
                            out_path: str = "subgraph.v") -> str:

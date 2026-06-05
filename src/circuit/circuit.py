@@ -178,15 +178,18 @@ class Circuit:
         self._topo = order
         return order
 
-    def simulate(self, inputs: dict[str, int]) -> dict[str, int]:
-        """Evaluate the circuit for the given primary-input bit values.
+    def simulate_values(self, inputs: dict[str, int]) -> dict[int, int]:
+        """Evaluate the circuit and return *every* node's bit value.
 
         Args:
             inputs: maps primary-input net names (e.g. ``"io_a[3]"`` or a scalar
                 port name) to ``0`` / ``1``.  Unspecified inputs default to 0.
 
         Returns:
-            Maps each primary-output net name to its computed bit value.
+            Maps each node id to its computed bit value — primary outputs,
+            internal gates, constants and inputs alike.  Use this when you need
+            visibility into internal signals; :meth:`simulate` is the
+            output-only convenience wrapper.
         """
         value: dict[int, int] = {}
         const_value = {CONST0: 0, CONST1: 1, CONSTX: 0}
@@ -203,6 +206,19 @@ class Circuit:
                 assert node.logic is not None
                 value[nid] = node.logic(*(value[i] for i in node.inputs))
 
+        return value
+
+    def simulate(self, inputs: dict[str, int]) -> dict[str, int]:
+        """Evaluate the circuit for the given primary-input bit values.
+
+        Args:
+            inputs: maps primary-input net names (e.g. ``"io_a[3]"`` or a scalar
+                port name) to ``0`` / ``1``.  Unspecified inputs default to 0.
+
+        Returns:
+            Maps each primary-output net name to its computed bit value.
+        """
+        value = self.simulate_values(inputs)
         return {self.nodes[nid].net: value[nid] for nid in self.po_nodes}
 
     # ------------------------------------------------------------------

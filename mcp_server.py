@@ -66,6 +66,39 @@ def extract_subgraph(inputs: list[str], outputs: list[str],
 
 
 @mcp.tool()
+def simulate(pattern_num: int = 100,
+             fixed_inputs: dict[str, int] | None = None,
+             watch: list[str] | None = None,
+             seed: int | None = None) -> str:
+    """Simulate the current circuit and report bus values across input patterns.
+
+    With no arguments, applies ``pattern_num`` (default 100) random input
+    patterns and reports, for each pattern, every output bus as a decimal
+    integer (and each input bus, so the rows are interpretable).
+
+    Pin specific inputs with ``fixed_inputs`` — a mapping whose keys are:
+    - a bus base (``"IN1"``) → the integer is spread over its bits (MSB..LSB),
+    - a single bit (``"IN1[0]"``), or
+    - a scalar port name.
+    Pinned bits stay constant across patterns; the rest are randomised. If every
+    input bit is pinned, exactly one (deterministic) pattern is run.
+
+    Use ``watch`` to surface internal signals: pass a single net name
+    (``"_0007_"``, ``"n33"``) to see its raw bit, or an internal bus base
+    (``"sum"``) to gather its bits into an integer column.
+
+    ``seed`` makes the random patterns reproducible.
+
+    Inputs are validated, not silently coerced. An unknown input name, a single
+    bit set to anything but 0/1, or a bus integer that overflows its width all
+    raise an error naming the input and its allowed range. When a bus is only
+    partially pinned, the report header flags it with a NOTE (its remaining bits
+    are randomised), so a partial column is never mistaken for a chosen value.
+    """
+    return session.simulate(pattern_num, fixed_inputs, watch, seed)
+
+
+@mcp.tool()
 def print_xor_stats(detail: bool = False) -> str:
     """Extract XOR gates from the current circuit and report their chains.
 
