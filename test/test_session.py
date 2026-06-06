@@ -23,11 +23,24 @@ def test_load(session):
 def test_subgraph_extraction(session, out_dir):
     session.load("examples/Mul_INT16.aig")
     p = str(out_dir / "test_sub.v")
-    result = session.extract_subcircuit(["IN1[0]", "IN2[0]"], ["Out[0]"], p)
+    # outputs-first signature; Out[0] depends only on IN1[0], IN2[0].
+    result = session.extract_subcircuit(["Out[0]"], ["IN1[0]", "IN2[0]"], p)
     assert "written to" in result and "PIs=2" in result
     # read back (names are sanitised: IN1[0] -> IN1_0, etc.)
     c2 = Circuit.from_file(p, session._lib())
     assert c2.simulate({"IN1_0": 1, "IN2_0": 1}) == {"Out_0": 1}
+
+
+def test_subgraph_auto_discovers_inputs(session, out_dir):
+    session.load("examples/Mul_INT16.aig")
+    p = str(out_dir / "auto_sub.v")
+    # Under-specify inputs: Out[2] needs more than IN1[0]/IN2[0]. The extractor
+    # surfaces the rest as new PIs instead of failing, and flags them.
+    result = session.extract_subcircuit(["Out[2]"], ["IN1[0]", "IN2[0]"], p)
+    assert "auto-added" in result
+    # Omitting inputs entirely also works (full cone to primary inputs).
+    result2 = session.extract_subcircuit(["Out[0]"], out_path=p)
+    assert "written to" in result2 and "PIs=2" in result2
 
 
 def test_loaded_circuit_queries(session):

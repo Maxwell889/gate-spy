@@ -81,16 +81,29 @@ def test_subgraph_and_verilog_roundtrip(lib, out_dir):
     from src.circuit.subgraph import extract_subgraph
     from src.circuit.verilog_writer import write_verilog
 
-    sub = extract_subgraph(c, ["a", "b"], ["axb"])
+    # outputs-first; inputs ["a","b"] cut the cone -> sub computes axb from a,b
+    sub = extract_subgraph(c, ["axb"], ["a", "b"])
     p = out_dir / "sub.v"
     write_verilog(sub, str(p))
     c2 = Circuit.from_file(str(p), lib)
     assert c2.simulate({"a": 1, "b": 1}) == {"axb": 0}
     assert c2.simulate({"a": 0, "b": 1}) == {"axb": 1}
 
-    # boundary error
-    with pytest.raises(ValueError, match="outside the subgraph"):
-        extract_subgraph(c, ["a", "b"], ["co"])  # co needs cin too
+    # general extraction: an under-specified input set no longer errors — the
+    # missing dependency (cin) surfaces as an extra primary input instead.
+    sub2 = extract_subgraph(c, ["co"], ["a", "b"])  # co also needs cin
+    assert set(sub2.input_nets) == {"a", "b", "cin"}
+    p2 = out_dir / "sub2.v"
+    write_verilog(sub2, str(p2))
+    c3 = Circuit.from_file(str(p2), lib)
+    # co = majority(a,b,cin); check a couple of patterns against the original
+    assert c3.simulate({"a": 1, "b": 1, "cin": 0}) == {"co": 1}
+    assert c3.simulate({"a": 1, "b": 0, "cin": 1}) == {"co": 1}
+    assert c3.simulate({"a": 0, "b": 0, "cin": 1}) == {"co": 0}
+
+    # omitting inputs entirely extracts the full cone to primary inputs
+    sub3 = extract_subgraph(c, ["co"])
+    assert set(sub3.input_nets) == {"a", "b", "cin"}
 
 
 def test_to_dot(lib, out_dir):

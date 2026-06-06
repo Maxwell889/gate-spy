@@ -91,7 +91,13 @@ class AdderCircuit:
         trees.sort(key=len, reverse=True)
         return trees
 
-    def _depth(self, tree: list[Adder]) -> int:
+    def _adder_depths(self, tree: list[Adder]) -> dict[int, int]:
+        """Map ``id(adder) -> depth`` = 1 + max depth of the adders feeding it.
+
+        An adder fed only by tree-external signals is depth 1.  Many adders per
+        level is the compression tree (parallel reduction); a trailing run of
+        single-adder levels is the carry-propagate chain (CPA), a serial ripple.
+        """
         out = self._outputs_to_adder(tree)
         memo: dict[int, int] = {}
 
@@ -101,7 +107,60 @@ class AdderCircuit:
                     (depth(out[l]) for l in a.inputs if l in out), default=0)
             return memo[id(a)]
 
-        return max((depth(a) for a in tree), default=0)
+        return {id(a): depth(a) for a in tree}
+
+    def _depth(self, tree: list[Adder]) -> int:
+        return max(self._adder_depths(tree).values(), default=0)
+
+    def _cpa_chain(self, tree: list[Adder],
+                   depths: dict[int, int]) -> list[Adder]:
+        """The trailing carry-propagate chain: the deepest levels that each hold
+        a single adder (a ripple carry), walking up until a level widens (>2).
+
+        Returns the CPA adders, or ``[]`` when the chain reaches the shallowest
+        level — meaning there is no wide compression region to separate from
+        (e.g. a lone half/full adder), so a carry-save cut is not meaningful.
+        """
+        from collections import defaultdict
+        by_depth: dict[int, list[Adder]] = defaultdict(list)
+        for a in tree:
+            by_depth[depths[id(a)]].append(a)
+        cpa: list[Adder] = []
+        d = max(by_depth, default=0)
+        while d >= 1 and len(by_depth[d]) <= 2:
+            cpa.extend(by_depth[d])
+            d -= 1
+        # d is now the deepest *wide* level. If we consumed everything (d == 0),
+        # the tree is all chain — no compression region to cut at.
+        return cpa if d >= 1 else []
+
+    def _carry_save_outputs(self, cpa: list[Adder]) -> list[int]:
+        """Signals the CPA reads from outside itself — the compression tree's
+        carry-save output rows.  Cut these as sub-graph outputs and append a CPA
+        to rebuild the non-redundant product ``a*b``.
+        """
+        produced = {r for a in cpa for r in (a.sum_root, a.carry_root)}
+        cs: list[int] = []
+        seen: set[int] = set()
+        for a in cpa:
+            for sig in a.inputs:
+                if sig not in produced and sig not in seen:
+                    seen.add(sig)
+                    cs.append(sig)
+        return cs
+
+    def _depth_profile(self, depths: dict[int, int],
+                       cpa: list[Adder]) -> str:
+        """Compact ``L<d>:<count>`` histogram, marking the tree/CPA boundary."""
+        from collections import Counter
+        hist = Counter(depths.values())
+        cpa_start = min((depths[id(a)] for a in cpa), default=None)
+        parts: list[str] = []
+        for d in sorted(hist):
+            if d == cpa_start:
+                parts.append("|CPA>")
+            parts.append(f"L{d}:{hist[d]}")
+        return " ".join(parts)
 
     def _name(self, nid: int) -> str:
         return self.circuit.nodes[nid].net or f"#{nid}"
@@ -139,7 +198,11 @@ class AdderCircuit:
         fa = sum(1 for a in big if a.kind == "FA")
         inputs, results = self._boundary(big)
         lim = None if detail else 12
-        return "\n".join([
+
+        depths = self._adder_depths(big)
+        cpa = self._cpa_chain(big, depths)
+
+        lines = [
             f"Adder extraction on {self.circuit.name}",
             f"    adders found : {len(self.adders)} "
             f"({len(self.full_adders())} full, {len(self.half_adders())} half)",
@@ -147,9 +210,27 @@ class AdderCircuit:
             f"    largest tree :",
             f"        adders     : {len(big)} ({fa} full, {len(big) - fa} half)",
             f"        carry depth: {self._depth(big)}",
+            f"        depth profile (adders/level): {self._depth_profile(depths, cpa)}",
+        ]
+
+        # When a compression tree + CPA separation is detected, surface the
+        # carry-save output row — the clean cut point for rebuilding a*b.
+        if cpa:
+            cpa_lo = min(depths[id(a)] for a in cpa)
+            cpa_hi = max(depths[id(a)] for a in cpa)
+            cs_out = self._carry_save_outputs(cpa)
+            lines += [
+                f"            (wide levels = compression tree; trailing "
+                f"1-wide chain = CPA / carry propagation)",
+                f"        CPA chain  : {len(cpa)} adders (depths {cpa_lo}..{cpa_hi})",
+                f"        carry-save out ({len(cs_out)}): {self._signals(cs_out, None)}",
+            ]
+
+        lines += [
             f"        operands in ({len(inputs)}) : {self._signals(inputs, lim)}",
             f"        results out ({len(results)}): {self._signals(results, lim)}",
-        ])
+        ]
+        return "\n".join(lines)
 
     def _signals(self, nids: list[int], limit: int | None = 12) -> str:
         def natural(name: str):

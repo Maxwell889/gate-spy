@@ -48,21 +48,32 @@ def get_node(node: str, depth: int = 2, detail: bool = False) -> str:
 
 
 @mcp.tool()
-def extract_subgraph(inputs: list[str], outputs: list[str],
+def extract_subgraph(outputs: list[str],
+                     inputs: list[str] | None = None,
                      out_path: str = "subgraph.v") -> str:
-    """Extract a closed subgraph between the given input/output signals.
+    """Extract the backward-cone sub-circuit that feeds ``outputs`` and write it.
 
-    ``inputs``/``outputs`` are lists of signal names (use port names from
-    ``read_file`` output or internal names discovered via ``get_node``).  The
-    subgraph is validated to be self-contained and written to ``out_path``.
-    The format is chosen by the file extension:
+    ``outputs`` (required) become the sub-circuit's primary outputs.  ``inputs``
+    (optional) is a list of signals to *cut* the fan-in walk at — each one that
+    is reached becomes a primary input and the walk does not go past it.  Any
+    dependency NOT covered by ``inputs`` is followed all the way to the circuit's
+    own primary inputs, which then become inputs of the sub-circuit too.
+
+    This extraction is *total*: it never fails with "outside the subgraph".  If
+    you under-specify ``inputs``, the missing dependencies simply surface as
+    extra primary inputs (the true support set), and the report flags them under
+    ``auto-added`` so the boundary is never silently wrong.  Omit ``inputs``
+    entirely to extract the full cone down to primary inputs.
+
+    Signal names come from ``read_file`` ports or ``get_node`` / ``find_cone``
+    internal names.  The output format follows the file extension of ``out_path``:
 
     - ``.v`` (default) — structural Verilog with library cells
     - ``.aig`` — binary AIGER, via ``scripts/v2aig.sh``
 
-    Returns a summary of the written circuit.
+    Returns a summary of the written circuit plus its resolved input list.
     """
-    return session.extract_subcircuit(inputs, outputs, out_path)
+    return session.extract_subcircuit(outputs, inputs, out_path)
 
 
 @mcp.tool()
@@ -87,6 +98,13 @@ def find_cone(signals: list[str],
     ``stop_at`` is a list of signal names where traversal halts — the signals
     are included in the report but not expanded further.  This lets you "clip"
     the cone at a known boundary (e.g. the normalisation shifter inputs).
+
+    CAUTION: when ``stop_at`` signals depend on each other (one is upstream of
+    another), the upstream one is *masked* — traversal halts at the downstream
+    one first, so the upstream never appears as a boundary.  Do NOT read "absent
+    from the boundary" as "does not reach the start signals".  To test whether a
+    single signal actually reaches a primary output, trace it on its own with
+    ``direction="forward"`` and no ``stop_at`` instead.
 
     ``depth`` caps the number of levels (0 = start signals only, -1 = unlimited).
     ``detail=True`` lists every node at every layer; otherwise each layer is

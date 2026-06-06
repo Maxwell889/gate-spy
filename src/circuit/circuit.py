@@ -319,6 +319,52 @@ class Circuit:
     # Cone traversal
     # ------------------------------------------------------------------
 
+    def _cone_reachable(self, start_ids: list[int], direction: str,
+                        stop_ids=frozenset(),
+                        depth: int = -1) -> tuple[dict[int, int], dict[int, list[int]]]:
+        """Core cone walk shared by :meth:`find_cone` and subgraph extraction.
+
+        BFS from *start_ids* along fan-in (``backward``) or fan-out
+        (``forward``).  A node is a *boundary* — reached but not expanded — when
+        it is a PI/PO or in *stop_ids* (start nodes are always expanded).
+        Traversal also stops past *depth* levels (-1 = unlimited).
+
+        Returns:
+            ``dist``: ``node_id -> distance`` from the start set (start = 0), in
+            BFS discovery order (dict insertion order).
+            ``parents``: ``node_id -> [neighbour ids]`` one hop toward the start
+            (every converging path, deduped).
+        """
+        if direction == "backward":
+            def nbr(nid: int) -> list[int]:
+                return self.nodes[nid].inputs
+        else:
+            def nbr(nid: int) -> list[int]:
+                return self.nodes[nid].fanouts
+
+        start_set = set(start_ids)
+        dist: dict[int, int] = {s: 0 for s in start_ids}
+        parents: dict[int, list[int]] = {}
+        frontier: list[int] = list(start_ids)
+        while frontier:
+            cur = frontier.pop(0)
+            d = dist[cur]
+            if cur not in start_set:
+                node = self.nodes[cur]
+                if node.is_pi or node.is_po or cur in stop_ids:
+                    continue  # boundary: included but not expanded
+            if depth >= 0 and d >= depth:
+                continue
+            for nb in nbr(cur):
+                if nb not in dist:
+                    dist[nb] = d + 1
+                    frontier.append(nb)
+                # Edge nb<-cur when cur is strictly closer to the start: cur is
+                # then a toward-start neighbour of nb (capture all paths, deduped).
+                if dist[nb] > d and cur not in parents.get(nb, ()):
+                    parents.setdefault(nb, []).append(cur)
+        return dist, parents
+
     def find_cone(self, signals: list[str], direction: str,
                   stop_at: list[str] | None = None,
                   depth: int = -1) -> dict:
@@ -335,6 +381,9 @@ class Circuit:
         - ``stop``: resolved node ids for the stop_at signals (if any)
         - ``layers``: list of ``{depth, node_ids, count}``, one per level
         - ``boundary``: leaf nodes broken down by why traversal stopped
+        - ``parents``: ``{node_id: [neighbour ids]}`` — for each visited node,
+          its neighbour(s) one step *toward* the start signals (i.e. the nodes
+          it was reached from).  Lets a caller rebuild the connection paths.
         - ``total_nodes``: total internal nodes visited (excludes start)
         - ``truncated``: whether the depth cap was hit
         """
@@ -355,70 +404,38 @@ class Circuit:
                 raise KeyError(f"unresolved signal in 'stop_at': {s!r}")
             stop_ids.add(n)
 
-        # Determine the neighbour direction
-        if direction == "backward":
-            def neighbours(nid: int) -> list[int]:
-                return self.nodes[nid].inputs
-        else:
-            def neighbours(nid: int) -> list[int]:
-                return self.nodes[nid].fanouts
+        # Shared traversal core (also used by subgraph extraction).
+        dist, parents = self._cone_reachable(start_ids, direction, stop_ids, depth)
+        start_set = set(start_ids)
 
-        # BFS: (node_id, distance_from_start)
-        # layer 0 = the start signals themselves (not counted in total_nodes)
-        visited: dict[int, int] = {}   # node_id -> distance
-        frontier: list[int] = list(start_ids)
-        for sid in start_ids:
-            visited[sid] = 0
-
-        layers_raw: dict[int, list[int]] = {}  # distance -> nodes (excludes layer 0)
-        stop_hit: list[int] = []                # nodes where we hit stop_at
-        pi_hit: list[int] = []                  # PI/PO nodes hit
-
-        while frontier:
-            cur = frontier.pop(0)
-            cur_dist = visited[cur]
-
-            # Check if this node is a stop condition (only for non-start nodes)
-            if cur not in set(start_ids):
-                node = self.nodes[cur]
-                if node.is_pi or node.is_po:
-                    pi_hit.append(cur)
-                    continue
-                if cur in stop_ids:
-                    stop_hit.append(cur)
-                    continue
-
-            # Depth cap
-            if depth >= 0 and cur_dist >= depth:
-                continue
-
-            for nb in neighbours(cur):
-                if nb not in visited:
-                    nb_dist = cur_dist + 1
-                    visited[nb] = nb_dist
-                    frontier.append(nb)
-                    # Track layers (exclude start layer)
-                    layers_raw.setdefault(nb_dist, []).append(nb)
-
-        # Build ordered layer list
-        layers: list[dict] = []
-        for d in sorted(layers_raw.keys()):
-            node_ids = layers_raw[d]
-            layers.append({"depth": d, "node_ids": node_ids, "count": len(node_ids)})
-
-        # Total internal nodes (excludes layer 0 start signals)
+        # Group reachable nodes into layers by distance (layer 0 = the start
+        # signals, excluded here). dict insertion order is BFS discovery order.
+        layers_raw: dict[int, list[int]] = {}
+        for nid, d in dist.items():
+            if d > 0:
+                layers_raw.setdefault(d, []).append(nid)
+        layers = [{"depth": d, "node_ids": layers_raw[d], "count": len(layers_raw[d])}
+                  for d in sorted(layers_raw)]
         total = sum(l["count"] for l in layers)
 
-        # Boundary signals: group by reason
+        # Boundary = reached-but-not-expanded nodes, grouped by why we stopped.
+        pi_hit: list[int] = []
+        stop_hit: list[int] = []
+        for nid in dist:
+            if nid in start_set:
+                continue
+            node = self.nodes[nid]
+            if node.is_pi or node.is_po:
+                pi_hit.append(nid)
+            elif nid in stop_ids:
+                stop_hit.append(nid)
         boundary: dict[str, list[int]] = {}
         if pi_hit:
             boundary["pi_po"] = pi_hit
         if stop_hit:
             boundary["stop_at"] = stop_hit
 
-        truncated = depth >= 0 and any(
-            d >= depth for d in layers_raw.keys()
-        )
+        truncated = depth >= 0 and any(d >= depth for d in layers_raw)
 
         return {
             "ok": True,
@@ -428,6 +445,7 @@ class Circuit:
             "depth_cap": depth,
             "layers": layers,
             "boundary": boundary,
+            "parents": parents,
             "total_nodes": total,
             "truncated": truncated,
         }

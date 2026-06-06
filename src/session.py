@@ -114,6 +114,24 @@ def _field_summary(fields: list[dict]) -> str:
     )
 
 
+def _compact_bus(names: list[str]) -> str:
+    """Group bit-nets into ``base[lo..hi] (n)`` form; scalars listed as-is."""
+    bus: dict[str, list[int]] = {}
+    scalars: list[str] = []
+    for n in names:
+        m = _BIT_RE.match(n)
+        if m:
+            bus.setdefault(m.group(1), []).append(int(m.group(2)))
+        else:
+            scalars.append(n)
+    parts: list[str] = []
+    for b, idx in sorted(bus.items()):
+        idx.sort()
+        parts.append(f"{b}[{idx[0]}..{idx[-1]}] ({len(idx)})")
+    parts.extend(sorted(scalars))
+    return ", ".join(parts) if parts else "(none)"
+
+
 def _render_table(cols: list[dict], n: int) -> str:
     """Render aligned, group-separated columns into a fixed-width table."""
     widths = [max(len(c["label"]), *(len(v) for v in c["values"]), 1)
@@ -452,12 +470,17 @@ class CircuitSession:
                 expanded further).
             depth: maximum levels to traverse (-1 = unlimited).  Layer 0 is the
                 start signals themselves.
-            detail: when True, lists every node at every layer; otherwise caps
-                each layer at 16 entries with an overflow note.
+            detail: when True, lists every node at every layer (with its logic
+                function and full connection list); otherwise caps each layer at
+                16 entries (boundary at 32) with an overflow note.
 
         Returns:
             A multiline text report structured for LLM comprehension: header,
-            per-layer listings, boundary-signal breakdown, and a summary.
+            per-layer listings, boundary-signal breakdown, and a summary.  Each
+            node line carries its gate type, fan-in/out, and a ``from:`` list of
+            the neighbour(s) one hop toward the start signals (so connection
+            paths can be rebuilt); each layer is prefixed with a gate-type
+            histogram.
         """
         c = self._current()
         data = c.find_cone(signals, direction, stop_at=stop_at, depth=depth)
@@ -513,7 +536,45 @@ class CircuitSession:
             )
         cap_str = str(depth) if depth >= 0 else "unlimited"
         lines.append(f"    depth cap  : {cap_str}")
+        lines.append(
+            "    edges      : every node lists 'from:' its neighbour(s) one step "
+            "toward the start signals (follow them to rebuild a path)")
         lines.append("")
+
+        # -- per-node / per-layer rendering helpers -----------------------
+        parents = data["parents"]
+
+        def _net(nid: int) -> str:
+            return c.nodes[nid].net or f"#{nid}"
+
+        def _from(nid: int) -> str:
+            """The node's neighbour(s) one hop toward the start signals."""
+            ps = parents.get(nid, [])
+            if not ps:
+                return "(start-adjacent)"
+            lim = ps if detail else ps[:3]
+            s = ", ".join(_net(p) for p in lim)
+            if len(ps) > len(lim):
+                s += f", +{len(ps) - len(lim)}"
+            return s
+
+        def _hist(nids: list[int]) -> str:
+            """Gate-type histogram for a layer, most frequent first."""
+            h: dict[str, int] = {}
+            for nid in nids:
+                k = c.nodes[nid].kind
+                h[k] = h.get(k, 0) + 1
+            return ", ".join(f"{k}×{v}"
+                             for k, v in sorted(h.items(), key=lambda kv: -kv[1]))
+
+        def _emit(nid: int, indent: str) -> None:
+            node = c.nodes[nid]
+            fn = f" [{node.cell.function}]" if (detail and node.cell) else ""
+            lines.append(
+                f"{indent}{_label(nid):<34s}{fn}  "
+                f"fanin={len(node.inputs)} fanout={len(node.fanouts)}"
+                f"  from: {_from(nid)}"
+            )
 
         # -- layers -------------------------------------------------------
         for layer in data["layers"]:
@@ -523,13 +584,9 @@ class CircuitSession:
             lines.append(
                 f"== Layer {d} (distance {d}) — {layer['count']} signals =="
             )
+            lines.append(f"   gates: {_hist(nids)}")
             for nid in shown:
-                node = c.nodes[nid]
-                fin = f"fanin={len(node.inputs)}"
-                fout = f"fanout={len(node.fanouts)}"
-                lines.append(
-                    f"  {_label(nid):<36s}  ► {fin:<10s}  ◄ {fout}"
-                )
+                _emit(nid, "  ")
             if not detail and len(nids) > LIMIT:
                 lines.append(
                     f"  (+{len(nids) - LIMIT} more — use detail=True for full list)"
@@ -540,6 +597,9 @@ class CircuitSession:
             lines.append("== (no internal layers traversed) ==\n")
 
         # -- boundary -----------------------------------------------------
+        # Boundary signals are the conclusion of the trace, so show more of them
+        # (BLIMIT) than the per-layer body before truncating.
+        BLIMIT = 32
         bdry = data["boundary"]
         if bdry:
             lines.append("== Boundary signals ==")
@@ -549,17 +609,12 @@ class CircuitSession:
                     lines.append(f"  Reached {label} ({len(nids)}):")
                 elif kind == "stop_at":
                     lines.append(f"  Reached stop_at ({len(nids)}):")
-                shown = nids if detail else nids[:LIMIT]
+                shown = nids if detail else nids[:BLIMIT]
                 for nid in shown:
-                    node = c.nodes[nid]
-                    fin = f"fanin={len(node.inputs)}"
-                    fout = f"fanout={len(node.fanouts)}"
+                    _emit(nid, "    ")
+                if not detail and len(nids) > BLIMIT:
                     lines.append(
-                        f"    {_label(nid):<34s}  ► {fin:<10s}  ◄ {fout}"
-                    )
-                if not detail and len(nids) > LIMIT:
-                    lines.append(
-                        f"    (+{len(nids) - LIMIT} more)"
+                        f"    (+{len(nids) - BLIMIT} more — use detail=True for full list)"
                     )
                 # Compact ranges
                 lines.append(f"    Compact  : {_compact_nets(nids)}")
@@ -588,21 +643,58 @@ class CircuitSession:
 
         return "\n".join(lines)
 
-    def extract_subcircuit(self, inputs: list[str], outputs: list[str],
+    def extract_subcircuit(self, outputs: list[str],
+                           inputs: list[str] | None = None,
                            out_path: str = "subgraph.v") -> str:
-        """Extract a closed subgraph, write as Verilog (``.v``) or AIG (``.aig``).
+        """Extract the backward-cone sub-circuit feeding *outputs*; write it.
 
-        The format is chosen by the file extension of *out_path*.  ``.aig``
-        output runs ``scripts/v2aig.sh`` as a post-processing step.
+        *outputs* become the sub-circuit's primary outputs.  *inputs* is an
+        optional list of signals to cut the fan-in walk at; any dependency not
+        covered there is followed to the primary inputs and surfaces as a fresh
+        PI — extraction never fails on a "missing" input.  The output format
+        follows *out_path*'s extension: ``.v`` structural Verilog, ``.aig``
+        binary AIGER (via ``scripts/v2aig.sh``).
+
+        The report lists the sub-circuit's resolved inputs and, when *inputs*
+        was given, flags any that were auto-discovered (dependencies you did not
+        list) or unused (requested but not reached) — so the support set is
+        never silently wrong.
         """
         import os
         import subprocess
         import tempfile
         from pathlib import Path
 
-        sub = extract_subgraph(self._current(), inputs, outputs)
-        ext = os.path.splitext(out_path)[1].lower()
+        circuit = self._current()
+        sub = extract_subgraph(circuit, outputs, inputs)
+        sub_inputs = list(sub.input_nets)
 
+        # Transparency: classify the sub-circuit's inputs against the request.
+        requested: set[str] = set()
+        for s in (inputs or []):
+            nid = circuit._node_by_ref(s)
+            if nid is not None:
+                requested.add(circuit.nodes[nid].net or "")
+        sub_input_set = set(sub_inputs)
+        auto_added = [n for n in sub_inputs if n not in requested]
+        unused: list[str] = []
+        for s in (inputs or []):
+            nid = circuit._node_by_ref(s)
+            net = circuit.nodes[nid].net if nid is not None else s
+            if net not in sub_input_set:
+                unused.append(s)
+
+        extra = [f"    inputs ({len(sub_inputs)}): {_compact_bus(sub_inputs)}"]
+        if auto_added and inputs:
+            extra.append(
+                f"    auto-added  : {_compact_bus(auto_added)} "
+                f"— deps surfaced as new PIs (not in your 'inputs')")
+        if unused:
+            extra.append(
+                f"    unused ins  : {', '.join(unused)} "
+                f"— not reached by any output's cone")
+
+        ext = os.path.splitext(out_path)[1].lower()
         if ext == ".aig":
             with tempfile.NamedTemporaryFile(suffix=".v", delete=False) as tf:
                 tf_v = tf.name
@@ -614,16 +706,14 @@ class CircuitSession:
                 check=True, capture_output=True, text=True,
             )
             os.unlink(tf_v)
-            aig_c = Circuit.from_aig_file(out_path)
-            return (
-                f"Subgraph extracted from {self.source}\n"
-                f"    written to  : {out_path}\n"
-                f"    {aig_c.summary()}"
-            )
+            written = Circuit.from_aig_file(out_path).summary()
         else:
             write_verilog(sub, out_path)
-            return (
-                f"Subgraph extracted from {self.source}\n"
-                f"    written to  : {out_path}\n"
-                f"    {sub.summary()}"
-            )
+            written = sub.summary()
+
+        return "\n".join([
+            f"Subgraph extracted from {self.source}",
+            f"    written to  : {out_path}",
+            f"    {written}",
+            *extra,
+        ])
