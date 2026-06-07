@@ -10,6 +10,7 @@ import re
 import sys
 from typing import TYPE_CHECKING
 
+from ..library import Cell
 from .node import _CONST_NET
 
 if TYPE_CHECKING:
@@ -31,10 +32,40 @@ _TERM = re.compile(
     re.VERBOSE,
 )
 
+# Built-in primitive gates recognised without a .lib file.
+# Each lambda takes *n* (input count) and returns a Liberty boolean function string.
+_PRIMITIVE_FUNCS = {
+    "not":  lambda n: "A'",
+    "buf":  lambda n: "A",
+    "and":  lambda n: "(" + " * ".join(chr(65 + i) for i in range(n)) + ")",
+    "nand": lambda n: "(" + " * ".join(chr(65 + i) for i in range(n)) + ")'",
+    "or":   lambda n: "(" + " + ".join(chr(65 + i) for i in range(n)) + ")",
+    "nor":  lambda n: "(" + " + ".join(chr(65 + i) for i in range(n)) + ")'",
+    "xor":  lambda n: "(" + " ^ ".join(chr(65 + i) for i in range(n)) + ")",
+    "xnor": lambda n: "(" + " ^ ".join(chr(65 + i) for i in range(n)) + ")'",
+}
+
 
 # ---------------------------------------------------------------------------
 # Verilog text helpers
 # ---------------------------------------------------------------------------
+
+
+def _ensure_primitive(lib, cell_name: str, n_inputs: int) -> None:
+    """Auto-register a built-in primitive gate if not already in *lib*."""
+    if cell_name in lib or cell_name not in _PRIMITIVE_FUNCS:
+        return
+    if cell_name in ("not", "buf") and n_inputs != 1:
+        raise ValueError(f"primitive '{cell_name}' expects 1 input, got {n_inputs}")
+    if cell_name not in ("not", "buf") and n_inputs < 2:
+        raise ValueError(f"primitive '{cell_name}' expects >= 2 inputs, got {n_inputs}")
+    pin_names = [chr(ord("A") + i) for i in range(n_inputs)]
+    lib.cells[cell_name] = Cell(
+        name=cell_name,
+        inputs=pin_names,
+        output="Y",
+        function=_PRIMITIVE_FUNCS[cell_name](n_inputs),
+    )
 
 
 def _clean_id(name: str) -> str:
@@ -219,11 +250,26 @@ def parse(circuit: Circuit, text: str) -> None:
         gate = re.match(r"(\w+)\s+(\\?\S+)\s*\((.*)\)\s*;?\s*$", stmt, re.DOTALL)
         if gate:
             cell_name, inst = gate.group(1), _clean_id(gate.group(2))
+            raw_conns = gate.group(3)
+
+            named = re.findall(r"\.(\w+)\s*\(\s*(.*?)\s*\)", raw_conns, re.DOTALL)
+            if named:
+                conns = {pin: net for pin, net in named}
+            else:
+                # Positional: first connection is the output, remainder are inputs.
+                parts = [p.strip() for p in _split_top(raw_conns)]
+                _ensure_primitive(circuit.lib, cell_name, len(parts) - 1)
+                if cell_name not in circuit.lib:
+                    sys.exit(f"Error: gate '{cell_name}' (instance '{inst}') "
+                             f"is not defined in library '{circuit.lib.name}'")
+                cell = circuit.lib[cell_name]
+                conns = {cell.output: parts[0]}
+                for i, net in enumerate(parts[1:]):
+                    conns[cell.inputs[i]] = net
+
             if cell_name not in circuit.lib:
                 sys.exit(f"Error: gate '{cell_name}' (instance '{inst}') "
                          f"is not defined in library '{circuit.lib.name}'")
-            conns = {pin: net for pin, net in
-                     re.findall(r"\.(\w+)\s*\(\s*(.*?)\s*\)", gate.group(3), re.DOTALL)}
             gates.append((cell_name, inst, conns))
             continue
         # Unknown statement (e.g. stray `endmodule`) — ignore.
