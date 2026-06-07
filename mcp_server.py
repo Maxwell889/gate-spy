@@ -57,33 +57,33 @@ def get_node(node: str, depth: int = 2, detail: bool = False) -> str:
     return session.node_info(node, depth, detail=detail)
 
 
-@mcp.tool()
-def extract_subgraph(outputs: list[str],
-                     inputs: list[str] | None = None,
-                     out_path: str = "subgraph.v") -> str:
-    """Extract the backward-cone sub-circuit that feeds ``outputs`` and write it.
+# @mcp.tool()
+# def extract_subgraph(outputs: list[str],
+#                      inputs: list[str] | None = None,
+#                      out_path: str = "subgraph.v") -> str:
+#     """Extract the backward-cone sub-circuit that feeds ``outputs`` and write it.
 
-    ``outputs`` (required) become the sub-circuit's primary outputs.  ``inputs``
-    (optional) is a list of signals to *cut* the fan-in walk at — each one that
-    is reached becomes a primary input and the walk does not go past it.  Any
-    dependency NOT covered by ``inputs`` is followed all the way to the circuit's
-    own primary inputs, which then become inputs of the sub-circuit too.
+#     ``outputs`` (required) become the sub-circuit's primary outputs.  ``inputs``
+#     (optional) is a list of signals to *cut* the fan-in walk at — each one that
+#     is reached becomes a primary input and the walk does not go past it.  Any
+#     dependency NOT covered by ``inputs`` is followed all the way to the circuit's
+#     own primary inputs, which then become inputs of the sub-circuit too.
 
-    This extraction is *total*: it never fails with "outside the subgraph".  If
-    you under-specify ``inputs``, the missing dependencies simply surface as
-    extra primary inputs (the true support set), and the report flags them under
-    ``auto-added`` so the boundary is never silently wrong.  Omit ``inputs``
-    entirely to extract the full cone down to primary inputs.
+#     This extraction is *total*: it never fails with "outside the subgraph".  If
+#     you under-specify ``inputs``, the missing dependencies simply surface as
+#     extra primary inputs (the true support set), and the report flags them under
+#     ``auto-added`` so the boundary is never silently wrong.  Omit ``inputs``
+#     entirely to extract the full cone down to primary inputs.
 
-    Signal names come from ``read_file`` ports or ``get_node`` / ``find_cone``
-    internal names.  The output format follows the file extension of ``out_path``:
+#     Signal names come from ``read_file`` ports or ``get_node`` / ``find_cone``
+#     internal names.  The output format follows the file extension of ``out_path``:
 
-    - ``.v`` (default) — structural Verilog with library cells
-    - ``.aig`` — binary AIGER, via ``scripts/v2aig.sh``
+#     - ``.v`` (default) — structural Verilog with library cells
+#     - ``.aig`` — binary AIGER, via ``scripts/v2aig.sh``
 
-    Returns a summary of the written circuit plus its resolved input list.
-    """
-    return session.extract_subcircuit(outputs, inputs, out_path)
+#     Returns a summary of the written circuit plus its resolved input list.
+#     """
+#     return session.extract_subcircuit(outputs, inputs, out_path)
 
 
 @mcp.tool()
@@ -180,6 +180,99 @@ def print_adder_stats(detail: bool = False) -> str:
     all boundary signals are listed without truncation.
     """
     return session.adder_stats(detail=detail)
+
+
+# ---------------------------------------------------------------------------
+#  Code-modification workflow tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def edit(
+    matches: list[str] | None = None,
+    replacements: list[str] | None = None,
+    rewrite: str = "",
+    begin: str = "",
+    end: str = "",
+) -> str:
+    """Apply string replacements to the current Verilog source code.
+
+    Three modes, evaluated in priority order:
+
+    1. **Full rewrite** — ``rewrite`` is non-empty.
+       Replaces the **entire source file** with *rewrite*.
+       Example: ``rewrite="module top(a,b,c); assign c = a + b; endmodule"``
+
+    2. **Region replace** — ``begin`` and ``end`` are both non-empty.
+       Each is a regex that must match **exactly once**.  The span from
+       the start of the *begin* match through the end of the *end* match
+       (inclusive) is replaced by ``replacements[0]``.
+       Example: ``begin=r"wire n_2,"``, ``end=r"endmodule"``
+
+    3. **Exact-string replace** (default) — ``matches`` + ``replacements``.
+       Each string in ``matches`` must appear **exactly once** in the
+       current code.  Replacements are applied in order.
+
+    After applying, Yosys CEC verifies functional equivalence between the
+    old and new code.  If it fails (syntax error or functional mismatch) the
+    edit is **rejected** — the current code is NOT changed and nothing is
+    recorded.
+
+    On success the ICCAD-2022-Problem-A cost is computed and the edit is
+    recorded so it can be reverted later with ``revert``.
+
+    Returns a structured report with cost, reduction rate, and status.
+    """
+    return session.edit(
+        matches=matches, replacements=replacements,
+        rewrite=rewrite, begin=begin, end=end,
+    )
+
+
+@mcp.tool()
+def revert(depth: int = 1, id: int = 0, help: bool = False) -> str:
+    """Revert previous edits or show the modification history.
+
+    Parameters
+    ----------
+    help : bool
+        If True, show the full modification history table (id, time, cost
+        delta, status) instead of reverting.
+    depth : int
+        Number of edits to revert (default 1).  Ignored when *id* is set.
+    id : int
+        Revert to this modification id — all edits with id >= *id* are
+        dropped.  Use *id* to jump back to a specific state.  ``id=0``
+        means "not set" (the *depth* parameter is used instead).
+    """
+    return session.revert(depth=depth, id=id, help=help)
+
+
+@mcp.tool()
+def dump(path: str) -> str:
+    """Write the current Verilog source code to *path*.
+
+    Use this to save the latest (modified) code to a file after a series of
+    successful edits.  Returns a confirmation with file size.
+    """
+    return session.dump(path)
+
+
+@mcp.tool()
+def show(detail: bool = False, grep: str = "") -> str:
+    """Return the current Verilog source code with optional filtering.
+
+    Parameters
+    ----------
+    detail : bool
+        If False (default), return a uniformly-sampled abridged version
+        (blocks of lines interleaved with skip markers).  If True, return
+        the complete source.
+    grep : str
+        A regex pattern.  When non-empty, only matching lines are shown,
+        each with ±5 lines of surrounding context.  Overlapping context
+        windows are merged.  Ignores *detail* when set.
+    """
+    return session.show(detail=detail, grep=grep)
 
 
 if __name__ == "__main__":

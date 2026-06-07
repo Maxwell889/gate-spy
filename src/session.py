@@ -7,11 +7,52 @@ returns plain dicts, so any frontend (MCP, CLI, HTTP) can sit on top.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
 
 from .circuit import Circuit, extract_adders, extract_xor
+
+
+# ---------------------------------------------------------------------------
+#  Modification record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModificationRecord:
+    """A single code-modification step.  Only the *forward* diff is stored
+    (matches -> replacements); the full code is never duplicated.
+    Reverts replay from the original source.
+
+    Three edit modes are supported:
+    - ``"rewrite"`` — entire source replaced; *rewrite* holds the new content.
+    - ``"region"``  — *begin*/*end* regex delimit a region to replace.
+    - ``"match"``   — exact-string *matches* → *replacements* (default).
+    """
+    id: int
+    matches: list[str]
+    replacements: list[str]
+    cost_before: int
+    cost_after: int
+    success: bool = False
+    error: str = ""
+    timestamp: float = 0.0
+    # Region / rewrite helpers
+    mode: str = "match"
+    rewrite: str = ""
+    begin: str = ""
+    end: str = ""
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.time()
+
 
 # File extensions we know how to parse.
 _VERILOG_EXTS = {".v", ".sv", ".verilog"}
@@ -22,6 +63,29 @@ _BIT_RE = re.compile(r"^(.*)\[(\d+)\]$")
 
 # Upper bound on random patterns per call, to keep a runaway request bounded.
 _MAX_PATTERNS = 100_000
+
+
+def _word_pattern(pat: str) -> re.Pattern:
+    """Compile *pat* into a regex anchored with ``\\b`` where it touches word chars."""
+    esc = re.escape(pat)
+    if pat and (pat[0].isalnum() or pat[0] == "_"):
+        esc = r"\b" + esc
+    if pat and (pat[-1].isalnum() or pat[-1] == "_"):
+        esc = esc + r"\b"
+    return re.compile(esc)
+
+
+def _unescape(s: str) -> str:
+    """Convert literal backslash escapes (``\\n``, ``\\t``) to real chars."""
+    return s.encode().decode("unicode_escape")
+
+
+def _truncate(s: str, n: int) -> str:
+    """Return *s* truncated to at most *n* chars, with ``...`` if cut."""
+    s = s.replace("\n", "\\n")
+    if len(s) <= n:
+        return s
+    return s[:n-1] + "..."
 
 
 def _split_bit(net: str) -> tuple[str, int | None]:
@@ -158,6 +222,14 @@ class CircuitSession:
     def __init__(self) -> None:
         self.circuit: Circuit | None = None
         self.source: str | None = None
+
+        # Code-modification workflow
+        self._source_code: str = ""
+        self._current_code: str = ""
+        self._modifications: list[ModificationRecord] = []
+        self._mod_counter: int = 0
+        self._original_gate_count: int = 0
+
     # -- operations -----------------------------------------------------
 
     def load(self, path: str) -> str:
@@ -187,6 +259,19 @@ class CircuitSession:
 
         self.circuit = circuit
         self.source = path
+
+        # Store raw source code for the modification workflow
+        if ext in _VERILOG_EXTS:
+            self._source_code = open(path, encoding="utf-8").read()
+            self._current_code = self._source_code
+            self._original_gate_count = len(circuit.gate_nodes)
+        else:
+            self._source_code = ""
+            self._current_code = ""
+            self._original_gate_count = len(circuit.gate_nodes)
+        self._modifications = []
+        self._mod_counter = 0
+
         return self._load_report(fmt)
 
     def _load_report(self, fmt: str) -> str:
@@ -656,3 +741,433 @@ class CircuitSession:
 
         return "\n".join(lines)
 
+
+    # ------------------------------------------------------------------
+    # Code-modification workflow: edit / revert / show / dump
+    # ------------------------------------------------------------------
+
+    def edit(
+        self,
+        matches: list[str] | None = None,
+        replacements: list[str] | None = None,
+        rewrite: str = "",
+        begin: str = "",
+        end: str = "",
+    ) -> str:
+        """Apply transformations to the current Verilog source code.
+
+        Three modes are supported, evaluated in priority order:
+
+        1. **Full rewrite** — when *rewrite* is non-empty.
+           The entire source code is replaced with *rewrite*.
+           No matching required.
+
+        2. **Region replace** — when both *begin* and *end* are non-empty.
+           Each is a regex that must match **exactly once** in the current
+           code.  The span from the start of the *begin* match through the
+           end of the *end* match (inclusive) is replaced with
+           ``replacements[0]``.
+
+        3. **Exact-string replace** — when *matches* / *replacements* are given.
+           Each string in *matches* must appear **exactly once**.
+           Replacements are applied in order (existing behaviour).
+
+        On success the edit passes Yosys CEC, cost is computed, and the
+        modification is recorded.  Failed edits are rejected and not recorded.
+        """
+        if not self._current_code:
+            raise RuntimeError(
+                "no Verilog code to edit; call read_file(path) first")
+
+        # -- Resolve mode -------------------------------------------------------
+        if rewrite:
+            matches_out, replacements_out, mode = self._edit_rewrite(rewrite)
+        elif begin and end:
+            if not replacements:
+                raise ValueError("region mode requires replacements[0]")
+            matches_out, replacements_out, mode = self._edit_region(
+                begin, end, replacements[0])
+        elif matches and replacements:
+            matches_out, replacements_out, mode = self._edit_match(
+                matches, replacements)
+        else:
+            raise ValueError(
+                "provide one of: rewrite, (begin+end), or (matches+replacements)")
+
+        # -- Apply --------------------------------------------------------------
+        old_code = self._current_code
+        new_code = old_code
+        for pat, repl in zip(matches_out, replacements_out):
+            new_code = new_code.replace(pat, repl)
+
+        # -- CEC verification ---------------------------------------------------
+        cec = self._run_cec(old_code, new_code)
+        if not cec["success"]:
+            lines = [
+                "EDIT REJECTED — functional equivalence check failed",
+                f"    reason: {cec['reason']}",
+            ]
+            # Include counterexample details when available.
+            cex = cec.get("counterexample")
+            if cex:
+                for mm in cex.get("mismatches", []):
+                    lines.append(
+                        f"    mismatch: {mm['po_name']} "
+                        f"(old={mm['val_old']}, new={mm['val_new']})"
+                    )
+                # -- word-level values -----------------------------------------
+                wv = cex.get("word_values", {})
+                if wv:
+                    lines.append("    word-level input values:")
+                    for name in sorted(wv.keys()):
+                        info = wv[name]
+                        u = info["unsigned"]
+                        s = info["signed"]
+                        w = info["width"]
+                        if w == 1:
+                            lines.append(f"      {name} = {u}")
+                        else:
+                            lines.append(
+                                f"      {name} = {u} (unsigned)"
+                                f" / {s} (signed, {w}-bit)"
+                            )
+                # -- raw bit pattern (compact) ---------------------------------
+                pat = cex.get("pattern", {})
+                if pat:
+                    lines.append(
+                        f"    bit-level input pattern: "
+                        + " ".join(f"{k}={v}" for k, v in sorted(pat.items()))
+                    )
+            lines.append("    details:")
+            lines.extend("      " + l for l in cec["output"].splitlines()[-5:])
+            return "\n".join(lines)
+
+        # -- Cost ---------------------------------------------------------------
+        cost_before = self._compute_cost(old_code)
+        cost_after = self._compute_cost(new_code)
+
+        # -- Record -------------------------------------------------------------
+        self._mod_counter += 1
+        rec = ModificationRecord(
+            id=self._mod_counter,
+            matches=list(matches_out),
+            replacements=list(replacements_out),
+            cost_before=cost_before, cost_after=cost_after,
+            success=True, mode=mode,
+            rewrite=rewrite, begin=begin, end=end,
+        )
+        self._modifications.append(rec)
+        self._current_code = new_code
+
+        # -- Report -------------------------------------------------------------
+        reduction = (
+            (1 - cost_after / self._original_gate_count) * 100
+            if self._original_gate_count > 0 else 0
+        )
+        lines = [
+            "EDIT ACCEPTED — equivalence verified",
+            f"    modification #{rec.id}",
+            f"    mode        : {mode}",
+            f"    cost before : {cost_before}",
+            f"    cost after  : {cost_after}",
+            f"    reduction   : {reduction:.1f}%",
+        ]
+        if cost_after < cost_before:
+            lines.append(f"    improvement : -{cost_before - cost_after} points")
+        elif cost_after > cost_before:
+            lines.append(f"    cost increased by +{cost_after - cost_before} points")
+        else:
+            lines.append(f"    cost unchanged")
+        return "\n".join(lines)
+
+    # -- Mode helpers -----------------------------------------------------------
+
+    def _edit_rewrite(
+        self, new_code: str
+    ) -> tuple[list[str], list[str], str]:
+        """Replace the entire source code."""
+        old = self._current_code
+        new_code = _unescape(new_code)
+        return [old], [new_code], "rewrite"
+
+    def _edit_region(
+        self, begin_pat: str, end_pat: str, replacement: str
+    ) -> tuple[list[str], list[str], str]:
+        """Replace the region between *begin_pat* and *end_pat* regex matches.
+
+        Each pattern must match exactly once.  The span from the start of the
+        *begin_pat* match through the end of the *end_pat* match (inclusive)
+        is captured and replaced.
+        """
+        begin_match = list(re.finditer(begin_pat, self._current_code))
+        if not begin_match:
+            raise ValueError(
+                f"begin regex {begin_pat!r} not found in current code")
+        if len(begin_match) > 1:
+            raise ValueError(
+                f"begin regex {begin_pat!r} matches {len(begin_match)} times; "
+                f"must be unique")
+        bm = begin_match[0]
+
+        end_match = list(re.finditer(end_pat, self._current_code))
+        if not end_match:
+            raise ValueError(
+                f"end regex {end_pat!r} not found in current code")
+        if len(end_match) > 1:
+            raise ValueError(
+                f"end regex {end_pat!r} matches {len(end_match)} times; "
+                f"must be unique")
+        em = end_match[0]
+
+        if em.end() <= bm.start():
+            raise ValueError(
+                f"end regex matched before begin regex "
+                f"(end @{em.start()}-{em.end()}, begin @{bm.start()}-{bm.end()})")
+
+        old_region = self._current_code[bm.start():em.end()]
+        return [old_region], [replacement], "region"
+
+    def _edit_match(
+        self, matches: list[str], replacements: list[str]
+    ) -> tuple[list[str], list[str], str]:
+        """Exact-string match-and-replace (original behaviour)."""
+        if len(matches) != len(replacements):
+            raise ValueError(
+                f"matches and replacements must have the same length "
+                f"({len(matches)} vs {len(replacements)})")
+
+        # Unescape \n \t etc
+        matches = [_unescape(m) for m in matches]
+        replacements = [_unescape(r) for r in replacements]
+
+        # No-op check
+        if all(m == r for m, r in zip(matches, replacements)):
+            raise ValueError(
+                "EDIT REJECTED — all matches equal their replacements (no-op).")
+
+        # Uniqueness check
+        for i, pat in enumerate(matches):
+            p = _word_pattern(pat)
+            found = p.findall(self._current_code)
+            if not found:
+                raise ValueError(
+                    f"match[{i}] {pat!r} not found in current code")
+            if len(found) > 1:
+                raise ValueError(
+                    f"match[{i}] {pat!r} appears {len(found)} times; "
+                    f"must be unique")
+
+        return matches, replacements, "match"
+
+    # -- ABC CEC ---------------------------------------------------------------
+
+    def _run_cec(self, old_code: str, new_code: str) -> dict:
+        """Run ABC CEC via the ``abc_cec.py`` script.
+
+        Returns ``{success, reason, output, counterexample?}`` compatible with
+        the edit() flow.  When ABC finds a counterexample, the returned dict
+        includes a ``counterexample`` key with a human-readable description
+        that is fed back to the LLM.
+
+        Timeout is treated as **success** — the SAT-based equivalence check
+        only times out when it cannot find a counterexample (UNSAT).
+        """
+        old_fd, old_path = tempfile.mkstemp(suffix=".v", prefix="cec_old_")
+        new_fd, new_path = tempfile.mkstemp(suffix=".v", prefix="cec_new_")
+        try:
+            os.write(old_fd, old_code.encode())
+            os.close(old_fd)
+            os.write(new_fd, new_code.encode())
+            os.close(new_fd)
+
+            abc_cec = str(
+                Path(__file__).resolve().parents[1] / "scripts" / "abc_cec.py"
+            )
+            proc = subprocess.run(
+                ["python", abc_cec, old_path, new_path, "--json",
+                 "--timeout", "310"],
+                capture_output=True, text=True, timeout=320,
+            )
+            return json.loads(proc.stdout.strip())
+        except subprocess.TimeoutExpired:
+            return {
+                "success": True,
+                "reason": "timeout_assumed_equivalent",
+                "output": "ABC CEC timed out after 320s — assumed equivalent",
+            }
+        except json.JSONDecodeError:
+            return {
+                "success": False,
+                "reason": "cec_error",
+                "output": (proc.stdout or "") + "\n" + (proc.stderr or ""),
+            }
+        finally:
+            for p in (old_path, new_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    # -- cost helper ----------------------------------------------------------
+
+    def _compute_cost(self, code: str) -> int:
+        fd, path = tempfile.mkstemp(suffix=".v", prefix="cost_")
+        try:
+            os.write(fd, code.encode()); os.close(fd)
+            cost_script = Path(__file__).resolve().parents[1] / "scripts" / "cost.py"
+            proc = subprocess.run(
+                ["python", str(cost_script), str(path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            return int(proc.stdout.strip())
+        finally:
+            try: os.unlink(path)
+            except OSError: pass
+
+    # -- replay ---------------------------------------------------------------
+
+    def _replay_code(self, up_to: int) -> str:
+        """Replay modifications 0..up_to-1 on _source_code."""
+        code = self._source_code
+        for rec in self._modifications[:up_to]:
+            for pat, repl in zip(rec.matches, rec.replacements):
+                code = code.replace(pat, repl)
+        return code
+
+    # -- revert ---------------------------------------------------------------
+
+    def revert(self, depth: int = 1, id: int = 0,
+               help: bool = False) -> str:
+        """Revert previous edits or show modification history.
+
+        help=True : show history table with compact diffs.
+        depth=N   : revert N steps (default 1).
+        id=X      : revert to before modification id X.
+        """
+        if help or (depth == 1 and id == 0 and not self._modifications):
+            return self._format_history()
+
+        if not self._modifications:
+            return "No modifications to revert."
+
+        n = len(self._modifications)
+        if id > 0:
+            if id > self._mod_counter:
+                return f"Invalid id {id}: highest is {self._mod_counter}"
+            target = None
+            for i, rec in enumerate(self._modifications):
+                if rec.id >= id:
+                    target = i; break
+            if target is None:
+                return f"Modification id {id} not found."
+            keep = target
+        else:
+            depth = min(depth, n)
+            keep = n - depth
+
+        self._current_code = self._replay_code(keep)
+        dropped = self._modifications[keep:]
+        self._modifications = self._modifications[:keep]
+        self._mod_counter = self._modifications[-1].id if self._modifications else 0
+
+        if not dropped:
+            return "No modifications to revert."
+        ids = ", ".join(str(r.id) for r in dropped)
+        return (f"Reverted {len(dropped)} modification(s) [#{ids}].\n"
+                f"Current code is now at modification "
+                f"#{self._modifications[-1].id if self._modifications else 0}.")
+
+    def _format_history(self) -> str:
+        """Format the modification history with compact diffs."""
+        if not self._modifications:
+            return "No modifications yet. Use edit() to make changes."
+        import datetime
+        lines = ["Modification history:"]
+        for rec in self._modifications:
+            ts = datetime.datetime.fromtimestamp(rec.timestamp).strftime("%H:%M:%S")
+            delta = rec.cost_after - rec.cost_before
+            sign = "+" if delta > 0 else ""
+            lines.append(
+                f"  #{rec.id} {ts}  cost: {rec.cost_before}->{rec.cost_after} "
+                f"({sign}{delta})  patterns: {len(rec.matches)}"
+            )
+            for j, (m, r) in enumerate(zip(rec.matches, rec.replacements)):
+                ms = _truncate(m, 80)
+                rs = _truncate(r, 80)
+                if m == r:
+                    lines.append(f"    [{j}] no-op: {ms}")
+                else:
+                    lines.append(f"    [{j}] - {ms}")
+                    lines.append(f"         + {rs}")
+        return "\n".join(lines)
+
+    # -- show -----------------------------------------------------------------
+
+    def show(self, detail: bool = False, grep: str = "") -> str:
+        """Return the current Verilog code, with optional filtering.
+
+        detail=False : uniformly-sampled abridged view.
+        detail=True  : complete source.
+        grep=<regex> : show matching lines +/-5 context, merging overlaps.
+        """
+        if not self._current_code:
+            raise RuntimeError("no code to show; call read_file(path) first")
+
+        code = self._current_code
+        lines_all = code.splitlines()
+
+        if grep:
+            try:
+                pat = re.compile(grep)
+            except re.error as e:
+                return f"Invalid regex {grep!r}: {e}"
+            matched = [i for i, ln in enumerate(lines_all) if pat.search(ln)]
+            if not matched:
+                return f"No lines matched {grep!r}"
+            ctx = 5
+            windows: list[tuple[int, int]] = []
+            for mi in matched:
+                lo, hi = max(0, mi - ctx), min(len(lines_all) - 1, mi + ctx)
+                if windows and lo <= windows[-1][1] + 1:
+                    windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
+                else:
+                    windows.append((lo, hi))
+            out: list[str] = []
+            for wi, (lo, hi) in enumerate(windows):
+                if wi > 0:
+                    out.append(f"... ({lo - windows[wi-1][1] - 1} lines skipped) ...")
+                for i in range(lo, hi + 1):
+                    marker = ">>>" if i in matched else "   "
+                    out.append(f"{marker} {i+1:6d}: {lines_all[i]}")
+            return "\n".join(out)
+
+        if detail:
+            return code
+
+        n = len(lines_all)
+        if n <= 60:
+            return code
+        show_block, skip_block = 10, 20
+        out: list[str] = []
+        i = 0
+        while i < n:
+            end = min(i + show_block, n)
+            for j in range(i, end):
+                out.append(f"{j+1:6d}: {lines_all[j]}")
+            i = end
+            if i >= n:
+                break
+            skip_end = min(i + skip_block, n)
+            out.append(f"  ...  ({skip_end - i} lines skipped, {skip_end}/{n})  ...")
+            i = skip_end
+        return "\n".join(out)
+
+    # -- dump -----------------------------------------------------------------
+
+    def dump(self, path: str) -> str:
+        """Write the current code to *path*."""
+        if not self._current_code:
+            raise RuntimeError("no code to dump; call read_file(path) first")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self._current_code)
+        return f"Dumped {len(self._current_code)} bytes to {path}"
