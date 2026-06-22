@@ -14,33 +14,8 @@ def session():
 def test_load(session):
     aiger = session.load("examples/Mul_INT16.aig")
     assert "aiger" in aiger and "Mul_INT16" in aiger and "PIs=32" in aiger
-    assert "IN1[0..15]" in aiger and "Out[0..31]" in aiger  # port listing
+    assert "IN1[0..15]" in aiger and "Out[0..31]" in aiger
     assert session.circuit is not None and session.source == "examples/Mul_INT16.aig"
-    verilog = session.load("examples/Mul_F16_synth.v")
-    assert "MulRecFN" in verilog and "io_a[0..16]" in verilog
-
-
-def test_subgraph_extraction(session, out_dir):
-    session.load("examples/Mul_INT16.aig")
-    p = str(out_dir / "test_sub.v")
-    # outputs-first signature; Out[0] depends only on IN1[0], IN2[0].
-    result = session.extract_subcircuit(["Out[0]"], ["IN1[0]", "IN2[0]"], p)
-    assert "written to" in result and "PIs=2" in result
-    # read back (names are sanitised: IN1[0] -> IN1_0, etc.)
-    c2 = Circuit.from_file(p, session._lib())
-    assert c2.simulate({"IN1_0": 1, "IN2_0": 1}) == {"Out_0": 1}
-
-
-def test_subgraph_auto_discovers_inputs(session, out_dir):
-    session.load("examples/Mul_INT16.aig")
-    p = str(out_dir / "auto_sub.v")
-    # Under-specify inputs: Out[2] needs more than IN1[0]/IN2[0]. The extractor
-    # surfaces the rest as new PIs instead of failing, and flags them.
-    result = session.extract_subcircuit(["Out[2]"], ["IN1[0]", "IN2[0]"], p)
-    assert "auto-added" in result
-    # Omitting inputs entirely also works (full cone to primary inputs).
-    result2 = session.extract_subcircuit(["Out[0]"], out_path=p)
-    assert "written to" in result2 and "PIs=2" in result2
 
 
 def test_loaded_circuit_queries(session):
@@ -137,5 +112,3 @@ def test_requires_loaded_circuit(session):
 def test_bad_paths(session):
     with pytest.raises(FileNotFoundError):
         session.load("examples/does_not_exist.aig")
-    with pytest.raises(ValueError, match="unsupported file type"):
-        session.load("examples/example.lib")

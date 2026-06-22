@@ -11,11 +11,7 @@ import os
 import random
 import re
 
-from .library import Library
 from .circuit import Circuit, extract_adders, extract_xor
-from .circuit.aig_parser import DEFAULT_LIB_PATH
-from .circuit.subgraph import extract_subgraph
-from .circuit.verilog_writer import write_verilog
 
 # File extensions we know how to parse.
 _VERILOG_EXTS = {".v", ".sv", ".verilog"}
@@ -162,23 +158,13 @@ class CircuitSession:
     def __init__(self) -> None:
         self.circuit: Circuit | None = None
         self.source: str | None = None
-        self._lib_cache: Library | None = None
-
-    # -- internals ------------------------------------------------------
-
-    def _lib(self) -> Library:
-        """The default Liberty library (``example.lib``), loaded once."""
-        if self._lib_cache is None:
-            self._lib_cache = Library.from_file(str(DEFAULT_LIB_PATH))
-        return self._lib_cache
-
     # -- operations -----------------------------------------------------
 
     def load(self, path: str) -> str:
         """Parse *path* into the current circuit and return its summary.
 
         Dispatches on the file extension: ``.v``/``.sv``/``.verilog`` are read
-        as gate-level Verilog (against the default library), ``.aig``/``.aag``
+        as gate-level Verilog (primitive gates only), ``.aig``/``.aag``
         as AIGER.  Raises ``FileNotFoundError`` / ``ValueError`` for a missing
         path or an unsupported extension.
         """
@@ -187,7 +173,7 @@ class CircuitSession:
 
         ext = os.path.splitext(path)[1].lower()
         if ext in _VERILOG_EXTS:
-            circuit = Circuit.from_file(path, self._lib())
+            circuit = Circuit.from_file(path)
             fmt = "verilog"
         elif ext in _AIGER_EXTS:
             circuit = Circuit.from_aig_file(path)
@@ -471,8 +457,10 @@ class CircuitSession:
             depth: maximum levels to traverse (-1 = unlimited).  Layer 0 is the
                 start signals themselves.
             detail: when True, lists every node at every layer (with its logic
-                function and full connection list); otherwise caps each layer at
-                16 entries (boundary at 32) with an overflow note.
+                function and full connection list) without any truncation.
+                When False (default), each layer is capped at 16 entries, the
+                boundary at 32 entries, and only the first 4 and last 3 layers
+                are shown — intermediate layers are elided with a count line.
 
         Returns:
             A multiline text report structured for LLM comprehension: header,
@@ -486,6 +474,8 @@ class CircuitSession:
         data = c.find_cone(signals, direction, stop_at=stop_at, depth=depth)
 
         LIMIT = 16
+        LAYER_HEAD = 4      # show first N layers in full
+        LAYER_TAIL = 3      # show last N layers in full
 
         def _label(nid: int) -> str:
             n = c.nodes[nid]
@@ -577,7 +567,20 @@ class CircuitSession:
             )
 
         # -- layers -------------------------------------------------------
-        for layer in data["layers"]:
+        all_layers = data["layers"]
+        n_layers = len(all_layers)
+
+        # Decide which layers to show.  detail=True → all; otherwise head + tail.
+        if detail or n_layers <= LAYER_HEAD + LAYER_TAIL + 2:
+            show_layers = list(all_layers)
+            skipped_start = n_layers  # never skip
+        else:
+            show_layers = all_layers[:LAYER_HEAD] + all_layers[-LAYER_TAIL:]
+            skipped_start = LAYER_HEAD
+            skipped_end = n_layers - LAYER_TAIL
+            skipped_count = skipped_end - skipped_start
+
+        for layer in show_layers:
             d = layer["depth"]
             nids = layer["node_ids"]
             shown = nids if detail else nids[:LIMIT]
@@ -591,6 +594,16 @@ class CircuitSession:
                 lines.append(
                     f"  (+{len(nids) - LIMIT} more — use detail=True for full list)"
                 )
+            lines.append("")
+
+        # Elide middle layers when compressed.
+        if not detail and skipped_start < n_layers:
+            skipped_mid = all_layers[skipped_start:skipped_end]
+            skipped_nodes = sum(la["count"] for la in skipped_mid)
+            lines.append(
+                f"...  ({skipped_count} intermediate layers skipped, "
+                f"{skipped_nodes} nodes — use detail=True for full output)  ..."
+            )
             lines.append("")
 
         if not data["layers"]:
@@ -643,77 +656,3 @@ class CircuitSession:
 
         return "\n".join(lines)
 
-    def extract_subcircuit(self, outputs: list[str],
-                           inputs: list[str] | None = None,
-                           out_path: str = "subgraph.v") -> str:
-        """Extract the backward-cone sub-circuit feeding *outputs*; write it.
-
-        *outputs* become the sub-circuit's primary outputs.  *inputs* is an
-        optional list of signals to cut the fan-in walk at; any dependency not
-        covered there is followed to the primary inputs and surfaces as a fresh
-        PI — extraction never fails on a "missing" input.  The output format
-        follows *out_path*'s extension: ``.v`` structural Verilog, ``.aig``
-        binary AIGER (via ``scripts/v2aig.sh``).
-
-        The report lists the sub-circuit's resolved inputs and, when *inputs*
-        was given, flags any that were auto-discovered (dependencies you did not
-        list) or unused (requested but not reached) — so the support set is
-        never silently wrong.
-        """
-        import os
-        import subprocess
-        import tempfile
-        from pathlib import Path
-
-        circuit = self._current()
-        sub = extract_subgraph(circuit, outputs, inputs)
-        sub_inputs = list(sub.input_nets)
-
-        # Transparency: classify the sub-circuit's inputs against the request.
-        requested: set[str] = set()
-        for s in (inputs or []):
-            nid = circuit._node_by_ref(s)
-            if nid is not None:
-                requested.add(circuit.nodes[nid].net or "")
-        sub_input_set = set(sub_inputs)
-        auto_added = [n for n in sub_inputs if n not in requested]
-        unused: list[str] = []
-        for s in (inputs or []):
-            nid = circuit._node_by_ref(s)
-            net = circuit.nodes[nid].net if nid is not None else s
-            if net not in sub_input_set:
-                unused.append(s)
-
-        extra = [f"    inputs ({len(sub_inputs)}): {_compact_bus(sub_inputs)}"]
-        if auto_added and inputs:
-            extra.append(
-                f"    auto-added  : {_compact_bus(auto_added)} "
-                f"— deps surfaced as new PIs (not in your 'inputs')")
-        if unused:
-            extra.append(
-                f"    unused ins  : {', '.join(unused)} "
-                f"— not reached by any output's cone")
-
-        ext = os.path.splitext(out_path)[1].lower()
-        if ext == ".aig":
-            with tempfile.NamedTemporaryFile(suffix=".v", delete=False) as tf:
-                tf_v = tf.name
-            write_verilog(sub, tf_v)
-            script = Path(__file__).resolve().parents[1] / "scripts" / "v2aig.sh"
-            subprocess.run(
-                ["bash", str(script), tf_v, out_path,
-                 "-l", str(DEFAULT_LIB_PATH)],
-                check=True, capture_output=True, text=True,
-            )
-            os.unlink(tf_v)
-            written = Circuit.from_aig_file(out_path).summary()
-        else:
-            write_verilog(sub, out_path)
-            written = sub.summary()
-
-        return "\n".join([
-            f"Subgraph extracted from {self.source}",
-            f"    written to  : {out_path}",
-            f"    {written}",
-            *extra,
-        ])

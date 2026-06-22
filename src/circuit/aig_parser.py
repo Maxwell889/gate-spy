@@ -1,23 +1,19 @@
 """AIGER (And-Inverter Graph) parser — binary ``aig`` and ASCII ``aag``.
 
 An AIG uses only two-input AND gates plus inverters (folded into each literal's
-sign bit), so the graph is built from just the ``AND`` and ``NOT`` cells of a
-library (default: ``examples/example.lib``).  Format reference: ``aiger/FORMAT``.
+sign bit), so the graph is built from just the ``and`` and ``not`` primitives.
+Format reference: ``aiger/FORMAT``.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..primitives import get_primitive_logic
 from .node import PI, PO, CONST0, CONST1, _CONST_NET
 
 if TYPE_CHECKING:
     from .circuit import Circuit
-
-# example.lib lives at the repository root (../../examples/example.lib).
-DEFAULT_LIB_PATH = Path(__file__).resolve().parents[2] / "examples" / "example.lib"
 
 
 # ---------------------------------------------------------------------------
@@ -167,15 +163,9 @@ def _read_ascii_body(data: bytes, pos: int, aig: _Aig) -> None:
 # ---------------------------------------------------------------------------
 
 def _build(circuit: Circuit, aig: _Aig) -> None:
-    """Materialise *aig* into *circuit* using its AND and NOT cells."""
-    for needed in ("AND", "NOT"):
-        if needed not in circuit.lib:
-            sys.exit(f"Error: library '{circuit.lib.name}' lacks the '{needed}' "
-                     f"cell required to build an AIG")
-    and_cell = circuit.lib["AND"]
-    not_cell = circuit.lib["NOT"]
-    and_logic = and_cell.make_logic()
-    not_logic = not_cell.make_logic()
+    """Materialise *aig* into *circuit* using AND and NOT primitives."""
+    and_logic = get_primitive_logic("and", 2)
+    not_logic = get_primitive_logic("not", 1)
 
     var_node: dict[int, int] = {}     # AIG variable index -> driver node id
     const_node: dict[int, int] = {}   # 0/1 -> node id
@@ -193,8 +183,7 @@ def _build(circuit: Circuit, aig: _Aig) -> None:
             return var_node[var]
         rhs0, rhs1 = aig.and_rhs[var]    # an AND output we haven't built yet
         inputs = [lit_node(rhs0), lit_node(rhs1)]
-        nid = circuit._add_node("AND", f"n{var}", cell=and_cell,
-                                logic=and_logic, inputs=inputs)
+        nid = circuit._add_node("and", f"n{var}", logic=and_logic, inputs=inputs)
         var_node[var] = nid
         return nid
 
@@ -209,8 +198,7 @@ def _build(circuit: Circuit, aig: _Aig) -> None:
         if lit & 1:                      # negated -> route through an inverter
             if var not in neg_node:
                 neg_node[var] = circuit._add_node(
-                    "NOT", f"n{var}_n", cell=not_cell, logic=not_logic,
-                    inputs=[base])
+                    "not", f"n{var}_n", logic=not_logic, inputs=[base])
             return neg_node[var]
         return base
 

@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
-from ..library import Cell, LogicFn
+from typing import Callable
 
 # Node kinds that are not library gates.
 PI = "PI"        # primary input bit
@@ -28,8 +27,8 @@ class Node:
     net: str = ""                   # the net (bit) this node drives / names
     inputs: list[int] = field(default_factory=list)   # upstream node ids
     fanouts: list[int] = field(default_factory=list)  # downstream node ids
-    cell: Cell | None = None
-    logic: LogicFn | None = None
+    cell: None = None  # Deprecated, kept for compatibility
+    logic: Callable[..., int] | None = None
 
     @property
     def is_source(self) -> bool:
@@ -45,4 +44,5 @@ class Node:
 
     @property
     def is_gate(self) -> bool:
-        return self.cell is not None
+        # Gate node: not PI, PO, or constant
+        return self.kind not in {PI, PO, CONST0, CONST1, CONSTX}

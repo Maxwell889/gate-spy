@@ -2,7 +2,7 @@
 
 :class:`Circuit` models a technology-mapped, flattened gate-level netlist at
 **bit granularity**: each node drives exactly one bit (PI, PO, constant, or a
-library gate).
+primitive gate).
 """
 
 from __future__ import annotations
@@ -10,11 +10,11 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from typing import Callable
 
-from ..library import Cell, Library, LogicFn
 from .node import Node, CONST0, CONST1, CONSTX, _CONST_KIND
 from .parser import parse as _parse_verilog
-from .aig_parser import parse_aig as _parse_aig, DEFAULT_LIB_PATH
+from .aig_parser import parse_aig as _parse_aig
 
 def _strip_meta(text: str) -> str:
     """Remove comments and ``(* ... *)`` attributes from Verilog source."""
@@ -52,10 +52,9 @@ def _make_palette(kinds: set[str]) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 class Circuit:
-    """A bit-level gate netlist parsed from yosys-flattened Verilog."""
+    """A bit-level gate netlist using primitive gates only."""
 
-    def __init__(self, lib: Library) -> None:
-        self.lib = lib
+    def __init__(self) -> None:
         self.name = ""
         self.nodes: dict[int, Node] = {}
 
@@ -73,45 +72,45 @@ class Circuit:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_file(cls, verilog_path: str, lib: Library) -> Circuit:
+    def from_file(cls, verilog_path: str) -> Circuit:
+        """Parse a Verilog file containing primitive gates."""
         with open(verilog_path) as f:
-            return cls.from_string(f.read(), lib)
+            return cls.from_string(f.read())
 
     @classmethod
-    def from_string(cls, text: str, lib: Library) -> Circuit:
-        circuit = cls(lib)
+    def from_string(cls, text: str) -> Circuit:
+        """Parse Verilog text containing primitive gates."""
+        circuit = cls()
         _parse_verilog(circuit, _strip_meta(text))
         return circuit
 
     @classmethod
-    def from_aig_file(cls, aig_path: str, lib: Library | None = None) -> Circuit:
+    def from_aig_file(cls, aig_path: str) -> Circuit:
         """Parse an AIGER file (binary ``.aig`` or ASCII ``.aag``) into a Circuit.
 
-        *lib* defaults to ``examples/example.lib``; only its ``AND`` and ``NOT``
-        cells are used, since an AIG is built from those two primitives alone.
         The circuit name is taken from the file stem.
         """
         with open(aig_path, "rb") as f:
-            circuit = cls.from_aig_bytes(f.read(), lib)
+            circuit = cls.from_aig_bytes(f.read())
         circuit.name = Path(aig_path).stem
         return circuit
 
     @classmethod
-    def from_aig_bytes(cls, data: bytes, lib: Library | None = None) -> Circuit:
+    def from_aig_bytes(cls, data: bytes) -> Circuit:
         """Parse raw AIGER bytes (binary or ASCII) into a Circuit."""
-        if lib is None:
-            lib = Library.from_file(str(DEFAULT_LIB_PATH))
-        circuit = cls(lib)
+        circuit = cls()
         _parse_aig(circuit, data)
         return circuit
 
-    def _add_node(self, kind: str, net: str = "", *, cell: Cell | None = None,
-                  logic: LogicFn | None = None, inputs: list[int] | None = None) -> int:
+    def _add_node(self, kind: str, net: str = "", *,
+                  logic: Callable[..., int] | None = None,
+                  inputs: list[int] | None = None) -> int:
+        """Add a node to the circuit and return its ID."""
         nid = self._next_id
         self._next_id += 1
         self.nodes[nid] = Node(
             node_id=nid, kind=kind, net=net,
-            inputs=inputs or [], cell=cell, logic=logic,
+            inputs=inputs or [], cell=None, logic=logic,
         )
         return nid
 

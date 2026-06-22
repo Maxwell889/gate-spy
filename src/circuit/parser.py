@@ -1,7 +1,7 @@
 """Verilog structural-netlist parser.
 
-Converts yosys-flattened gate-level Verilog into the nodes and edges of a
-:class:`~src.circuit.circuit.Circuit` DAG.
+Converts gate-level Verilog (using primitive gates only) into the nodes and
+edges of a :class:`~src.circuit.circuit.Circuit` DAG.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import re
 import sys
 from typing import TYPE_CHECKING
 
-from ..library import Cell
+from ..primitives import get_primitive_logic, is_primitive, PRIMITIVE_ARITY
 from .node import _CONST_NET
 
 if TYPE_CHECKING:
@@ -32,40 +32,9 @@ _TERM = re.compile(
     re.VERBOSE,
 )
 
-# Built-in primitive gates recognised without a .lib file.
-# Each lambda takes *n* (input count) and returns a Liberty boolean function string.
-_PRIMITIVE_FUNCS = {
-    "not":  lambda n: "A'",
-    "buf":  lambda n: "A",
-    "and":  lambda n: "(" + " * ".join(chr(65 + i) for i in range(n)) + ")",
-    "nand": lambda n: "(" + " * ".join(chr(65 + i) for i in range(n)) + ")'",
-    "or":   lambda n: "(" + " + ".join(chr(65 + i) for i in range(n)) + ")",
-    "nor":  lambda n: "(" + " + ".join(chr(65 + i) for i in range(n)) + ")'",
-    "xor":  lambda n: "(" + " ^ ".join(chr(65 + i) for i in range(n)) + ")",
-    "xnor": lambda n: "(" + " ^ ".join(chr(65 + i) for i in range(n)) + ")'",
-}
-
-
 # ---------------------------------------------------------------------------
 # Verilog text helpers
 # ---------------------------------------------------------------------------
-
-
-def _ensure_primitive(lib, cell_name: str, n_inputs: int) -> None:
-    """Auto-register a built-in primitive gate if not already in *lib*."""
-    if cell_name in lib or cell_name not in _PRIMITIVE_FUNCS:
-        return
-    if cell_name in ("not", "buf") and n_inputs != 1:
-        raise ValueError(f"primitive '{cell_name}' expects 1 input, got {n_inputs}")
-    if cell_name not in ("not", "buf") and n_inputs < 2:
-        raise ValueError(f"primitive '{cell_name}' expects >= 2 inputs, got {n_inputs}")
-    pin_names = [chr(ord("A") + i) for i in range(n_inputs)]
-    lib.cells[cell_name] = Cell(
-        name=cell_name,
-        inputs=pin_names,
-        output="Y",
-        function=_PRIMITIVE_FUNCS[cell_name](n_inputs),
-    )
 
 
 def _clean_id(name: str) -> str:
@@ -249,27 +218,39 @@ def parse(circuit: Circuit, text: str) -> None:
 
         gate = re.match(r"(\w+)\s+(\\?\S+)\s*\((.*)\)\s*;?\s*$", stmt, re.DOTALL)
         if gate:
-            cell_name, inst = gate.group(1), _clean_id(gate.group(2))
+            cell_name = gate.group(1).lower()  # Normalize to lowercase
+            inst = _clean_id(gate.group(2))
             raw_conns = gate.group(3)
+
+            # Check if it's a supported primitive gate
+            if not is_primitive(cell_name):
+                sys.exit(f"Error: gate '{cell_name}' (instance '{inst}') "
+                         f"is not a supported primitive gate; "
+                         f"expected one of: {sorted(PRIMITIVE_ARITY.keys())}")
 
             named = re.findall(r"\.(\w+)\s*\(\s*(.*?)\s*\)", raw_conns, re.DOTALL)
             if named:
+                # Named port connections: infer inputs/outputs from connections
                 conns = {pin: net for pin, net in named}
             else:
-                # Positional: first connection is the output, remainder are inputs.
+                # Positional connections: first is output, rest are inputs
                 parts = [p.strip() for p in _split_top(raw_conns)]
-                _ensure_primitive(circuit.lib, cell_name, len(parts) - 1)
-                if cell_name not in circuit.lib:
-                    sys.exit(f"Error: gate '{cell_name}' (instance '{inst}') "
-                             f"is not defined in library '{circuit.lib.name}'")
-                cell = circuit.lib[cell_name]
-                conns = {cell.output: parts[0]}
-                for i, net in enumerate(parts[1:]):
-                    conns[cell.inputs[i]] = net
+                num_inputs = len(parts) - 1
 
-            if cell_name not in circuit.lib:
-                sys.exit(f"Error: gate '{cell_name}' (instance '{inst}') "
-                         f"is not defined in library '{circuit.lib.name}'")
+                # Validate input count
+                min_arity, max_arity = PRIMITIVE_ARITY[cell_name]
+                if num_inputs < min_arity:
+                    sys.exit(f"Error: gate '{cell_name}' requires at least {min_arity} "
+                             f"input(s), got {num_inputs} in instance '{inst}'")
+                if max_arity is not None and num_inputs > max_arity:
+                    sys.exit(f"Error: gate '{cell_name}' accepts at most {max_arity} "
+                             f"input(s), got {num_inputs} in instance '{inst}'")
+
+                # Build connection dict: output -> Y, inputs -> A, B, C, ...
+                conns = {"Y": parts[0]}
+                for i, net in enumerate(parts[1:]):
+                    conns[chr(ord("A") + i)] = net
+
             gates.append((cell_name, inst, conns))
             continue
         # Unknown statement (e.g. stray `endmodule`) — ignore.
@@ -290,21 +271,31 @@ def parse(circuit: Circuit, text: str) -> None:
             circuit._alias[lbit] = rbit
 
     # 3. Gate instances: create the node driving each output bit.
-    gate_inputs: list[tuple[int, str, dict[str, str]]] = []
+    gate_inputs: list[tuple[int, str, dict[str, str], int]] = []
     for cell_name, inst, conns in gates:
-        cell = circuit.lib[cell_name]
-        out_net = _single_net(conns.get(cell.output, ""), widths)
-        nid = circuit._add_node(cell_name, out_net, cell=cell, logic=cell.make_logic())
+        out_net = _single_net(conns.get("Y", ""), widths)
+
+        # Infer input pins: extract A, B, C, ... sequence from conns
+        input_pins = []
+        for pin_char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            if pin_char in conns:
+                input_pins.append(pin_char)
+            else:
+                break
+
+        num_inputs = len(input_pins)
+        logic = get_primitive_logic(cell_name, num_inputs)
+
+        nid = circuit._add_node(cell_name, out_net, logic=logic)
         if out_net:
             circuit._driver[out_net] = nid
-        gate_inputs.append((nid, cell_name, conns))
+        gate_inputs.append((nid, cell_name, conns, num_inputs))
 
     # 4. Resolve every gate's fan-in to driver node ids.
-    for nid, cell_name, conns in gate_inputs:
-        cell = circuit.lib[cell_name]
+    for nid, cell_name, conns, num_inputs in gate_inputs:
         circuit.nodes[nid].inputs = [
-            circuit._resolve(_single_net(conns.get(pin, ""), widths))
-            for pin in cell.inputs
+            circuit._resolve(_single_net(conns.get(chr(ord("A") + i), ""), widths))
+            for i in range(num_inputs)
         ]
 
     # 5. Primary output bits become sink nodes fed by their driver.

@@ -45,12 +45,15 @@ def _emit(circuit: Circuit) -> str:
     for node in circuit.nodes.values():
         if not node.is_gate:
             continue
-        out_pin = node.cell.output if node.cell else "Y"
+        # Output port uses Y uniformly
         out_net = _san(node.net) if node.net else f"w{node.node_id}"
-        conns = [f".{out_pin}({out_net})"]
+        conns = [f".Y({out_net})"]
+
+        # Input ports use A, B, C, ... standard naming
         for i, child in enumerate(node.inputs):
-            pin = node.cell.inputs[i] if node.cell and i < len(node.cell.inputs) else f"I{i}"
+            pin = chr(ord("A") + i)  # A, B, C, ...
             conns.append(f".{pin}({_net_str(circuit, child)})")
+
         lines.append(f"  {node.kind} _{inst_idx}_ ( {', '.join(conns)} );")
         inst_idx += 1
 

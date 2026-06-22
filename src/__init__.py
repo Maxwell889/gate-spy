@@ -1,6 +1,6 @@
 """Gate-level circuit reasoning toolkit."""
 
 from .circuit import Circuit, Node
-from .library import Cell, Library
+from .primitives import get_primitive_logic, is_primitive, PRIMITIVE_ARITY
 
-__all__ = ["Library", "Cell", "Circuit", "Node"]
+__all__ = ["Circuit", "Node", "get_primitive_logic", "is_primitive", "PRIMITIVE_ARITY"]

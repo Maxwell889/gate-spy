@@ -95,7 +95,7 @@ def _rebuild(circuit: Circuit, out_ids: list[int], sub: set[int],
              leaves: list[int]) -> Circuit:
     from .circuit import Circuit as C
 
-    result = C(circuit.lib)
+    result = C()
     old_to_new: dict[int, int] = {}
 
     # 1. leaves -> PIs, ordered by natural net name for readable ports.
@@ -116,7 +116,7 @@ def _rebuild(circuit: Circuit, out_ids: list[int], sub: set[int],
             continue
         node = circuit.nodes[old]
         new = result._add_node(node.kind, node.net or "",
-                               cell=node.cell, logic=node.logic,
+                               logic=node.logic,
                                inputs=[old_to_new[c] for c in node.inputs])
         old_to_new[old] = new
 
