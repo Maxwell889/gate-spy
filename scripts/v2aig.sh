@@ -57,19 +57,17 @@ fi
 
 TMP_BLIF=$(mktemp /tmp/v2aig_XXXXXX.blif)
 
-# Default to the project's example.lib if none specified.
-# read_liberty + techmap decompose library cells to primitives so the BLIF
-# uses plain .names format that ABC can read directly.
-if [[ -z "$LIBERTY" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    LIBERTY="$SCRIPT_DIR/../examples/example.lib"
+# If liberty file is provided, use it for technology mapping.
+# Otherwise, skip read_liberty and work with primitive gates directly.
+if [[ -n "$LIBERTY" ]]; then
+    echo "  Liberty: $LIBERTY"
+    # hierarchy first so auto-top picks the user's module, not a lib cell.
+    # read_liberty after hierarchy so techmap can expand library cells.
+    YOSYS_CMDS="$HIER; read_liberty $LIBERTY; proc; techmap; flatten; write_blif $TMP_BLIF"
+else
+    echo "  No liberty file (using primitive gates)"
+    YOSYS_CMDS="$HIER; proc; techmap; flatten; write_blif $TMP_BLIF"
 fi
-
-echo "  Liberty: $LIBERTY"
-
-# hierarchy first so auto-top picks the user's module, not a lib cell.
-# read_liberty after hierarchy so techmap can expand library cells.
-YOSYS_CMDS="$HIER; read_liberty $LIBERTY; proc; techmap; flatten; write_blif $TMP_BLIF"
 
 yosys -q -p "$YOSYS_CMDS" "$INPUT"
 
