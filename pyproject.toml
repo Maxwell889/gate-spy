@@ -5,6 +5,7 @@ description = "An LLM-agent-based framework for reasoning over gate-level netlis
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.27.2",
+    "langfuse>=4.8.1",
 ]
 
 [tool.pytest.ini_options]

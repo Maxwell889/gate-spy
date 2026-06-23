@@ -24,7 +24,7 @@ def read_file(path: str) -> str:
 
     Naming conventions:
     - Ports are listed as ``base[0..N-1] (N)`` for buses or plain names for scalars.
-    - For Verilog: internal wires keep their Yosys-generated names (e.g. _0001_).
+    - For Verilog: internal wires keep their names from Verilog (e.g. _0001_).
     - For AIGER: internal nodes are named ``n{v}`` for AND gates and ``n{v}_n``
       for their dedicated inverters (literal negation produces one NOT per gate).
     """
@@ -33,16 +33,26 @@ def read_file(path: str) -> str:
 
 @mcp.tool()
 def get_node(node: str, depth: int = 2, detail: bool = False) -> str:
-    """Inspect a signal/node of the current circuit.
+    """Inspect a signal, bus, or group of signals in the current circuit.
 
     ``node`` can be:
     - a port signal name (e.g. ``"Out[5]"``, ``"IN1[0]"``, ``"a"``)
     - an internal signal name (e.g. ``"_0001_"`` for Verilog, ``"n33"`` for AIGER)
     - a numeric node id
+    - a **bus base name** (e.g. ``"out1"``) — shows a summary of all bits
+    - a **prefix** or **wildcard pattern** (e.g. ``"csa_tree_*"``, ``"*adder*"``)
+      — searches for matching internal signals, grouped by common prefix
 
-    Returns the node's kind, basic info, and its fan-in / fan-out cones up to
-    ``depth`` levels (default 2).  When ``detail`` is True, all neighbours are
-    listed; otherwise at most 16 per level (excess shown as "(+N more)").
+    **Single-node mode**: returns the node's kind, basic info, and its fan-in /
+    fan-out cones up to ``depth`` levels (default 2).  When ``detail`` is True,
+    all neighbours are listed; otherwise at most 16 per level.
+
+    **Bus mode** (when the name matches ``basename[N]`` bits): returns width,
+    driver gate kinds, and example bit nets.
+
+    **Search mode** (when a wildcard ``*`` / ``?`` is used, or an exact match
+    fails but a prefix matches internal signals): returns matching signal groups
+    with gate-type histograms and example net names.
     """
     return session.node_info(node, depth, detail=detail)
 

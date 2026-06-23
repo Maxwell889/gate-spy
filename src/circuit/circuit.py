@@ -261,18 +261,159 @@ class Circuit:
                 fallback = nid
         return fallback
 
+    @staticmethod
+    def _net_group(net: str) -> str:
+        """Extract a group label from a net name by stripping trailing digits.
+
+        ``csa_tree_add_12_51_groupi_n_4138`` → ``csa_tree_add_12_51_groupi_n_*``
+        ``add_10_21_n_51`` → ``add_10_21_n_*``
+        """
+        m = re.match(r'^(.*[^\d])?\d+$', net)
+        if m:
+            base = m.group(1) or net.rstrip('0123456789')
+            return base.rstrip('_') + '_*'
+        return net
+
+    def _match_nodes(self, ref: str) -> dict | None:
+        """Try to match *ref* as a bus base name, prefix, or wildcard pattern.
+
+        Returns a dict with ``type`` and matched ``node_ids`` / ``groups``,
+        or ``None`` when nothing matches.
+        """
+        s = ref.strip()
+        has_wildcard = '*' in s or '?' in s
+
+        if has_wildcard:
+            # --- wildcard / glob match ---------------------------------
+            regex = '^' + re.escape(s).replace(r'\*', '.*').replace(r'\?', '.') + '$'
+            pat = re.compile(regex)
+            groups: dict[str, list[int]] = {}
+            for nid, node in self.nodes.items():
+                if node.net and not node.is_po and pat.match(node.net):
+                    groups.setdefault(self._net_group(node.net), []).append(nid)
+            if not groups:
+                return None
+            # flatten for easy counting
+            all_ids = [n for g in groups.values() for n in g]
+            return {"type": "wildcard", "pattern": s,
+                    "node_ids": all_ids, "groups": groups}
+
+        # --- bus base name: "out1" → out1[0], out1[1], ... ------------
+        if '[' not in s:
+            bits: dict[int, int] = {}
+            bus_pfx = s + "["
+            for nid, node in self.nodes.items():
+                if node.net.startswith(bus_pfx) and not node.is_po:
+                    rest = node.net[len(bus_pfx):]
+                    if rest.endswith(']'):
+                        try:
+                            idx = int(rest[:-1])
+                            bits[idx] = nid
+                        except ValueError:
+                            pass
+            if bits:
+                lo, hi = min(bits), max(bits)
+                node_ids = [bits[i] for i in range(lo, hi + 1) if i in bits]
+                kinds: dict[str, int] = {}
+                for nid in node_ids:
+                    k = self.nodes[nid].kind
+                    kinds[k] = kinds.get(k, 0) + 1
+                # determine I/O role
+                role = ""
+                if any(n.net in self.output_nets for n in (self.nodes[i] for i in node_ids)):
+                    role = "output"
+                elif any(n.net in self.input_nets for n in (self.nodes[i] for i in node_ids)):
+                    role = "input"
+                return {"type": "bus", "name": s,
+                        "width": len(node_ids), "range": f"{lo}..{hi}",
+                        "node_ids": node_ids, "kinds": kinds, "role": role}
+
+        # --- prefix match (no wildcard, no bus match) -----------------
+        groups: dict[str, list[int]] = {}
+        for nid, node in self.nodes.items():
+            if node.net.startswith(s) and not node.is_po:
+                groups.setdefault(self._net_group(node.net), []).append(nid)
+        if groups:
+            all_ids = [n for g in groups.values() for n in g]
+            return {"type": "prefix", "pattern": s,
+                    "node_ids": all_ids, "groups": groups}
+
+        return None
+
+    def _describe_bus(self, info: dict, detail: bool) -> str:
+        """Format a bus summary string from :meth:`_match_nodes` result."""
+        lines = [
+            f"Bus {info['name']}[{info['range']}]"
+            f" ({info['width']} bits{', ' + info['role'] if info['role'] else ''})",
+            f"    driver kinds: "
+            + ', '.join(f"{k}×{v}" for k, v in sorted(info['kinds'].items())),
+        ]
+        # show example bit nets (more when detail=True)
+        limit = len(info['node_ids']) if detail else min(6, len(info['node_ids']))
+        examples = [self.nodes[nid].net for nid in info['node_ids'][:limit]]
+        suffix = ', ...' if limit < len(info['node_ids']) else ''
+        lines.append(f"    example nets: {', '.join(examples)}{suffix}")
+        lines.append(
+            f'    Use "{info["name"]}[N]" for individual bit details.')
+        return '\n'.join(lines)
+
+    def _describe_search(self, info: dict, detail: bool) -> str:
+        """Format a prefix / wildcard search summary."""
+        groups = info['groups']
+        total = len(info['node_ids'])
+        lines = [f'Pattern "{info["pattern"]}" matched {total} signals'
+                 f' in {len(groups)} group{"s" if len(groups) != 1 else ""}:']
+        LIMIT = 24 if detail else 8
+        for gname, gids in sorted(groups.items(), key=lambda x: -len(x[1])):
+            gkinds: dict[str, int] = {}
+            for nid in gids:
+                k = self.nodes[nid].kind
+                gkinds[k] = gkinds.get(k, 0) + 1
+            kinds_str = ', '.join(f"{k}×{v}" for k, v in sorted(gkinds.items()))
+            lines.append(f"\n  {gname} ({len(gids)} signals)")
+            lines.append(f"    gates: {kinds_str}")
+            shown = gids[:LIMIT]
+            nets = []
+            for nid in shown:
+                net = self.nodes[nid].net
+                nets.append(net if len(net) <= 40 else net[:37] + '...')
+            lines.append(f"    example nets: {', '.join(nets)}"
+                         + (', ...' if len(gids) > LIMIT else ''))
+        lines.append(
+            '\nUse an exact net name (e.g. from "example nets" above)'
+            ' for individual inspection.')
+        return '\n'.join(lines)
+
     def describe_node(self, ref, depth: int = 2,
                       detail: bool = False) -> str:
-        """Human-/LLM-readable description of a node and its neighbourhood.
+        """Human-/LLM-readable description of a node, bus, or signal group.
 
-        *ref* is a node id or a signal name.  Reports the node's kind and basic
-        info plus its fan-in and fan-out cones up to *depth* levels.
-        *depth* caps the traversal; *detail=True* shows all neighbours
-        (otherwise at most 16 per level).
+        *ref* is a node id, a signal name, a bus base name (e.g. ``"out1"``),
+        or a wildcard pattern (``"csa_tree_*"``, ``"*adder*"``).
+
+        For a single node: reports its kind, fan-in / fan-out cones up to
+        *depth* levels.  For a bus: shows width and driver statistics.
+        For a pattern: lists matching signal groups with example nets.
+
+        *depth* caps the traversal for single-node mode; *detail=True* shows
+        all neighbours (otherwise at most 16 per level).
         """
         nid = self._node_by_ref(ref)
-        if nid is None:
+        if nid is not None:
+            return self._describe_single_node(nid, depth, detail)
+
+        # try bus / prefix / wildcard match
+        info = self._match_nodes(ref)
+        if info is None:
             raise KeyError(f"no node matching {ref!r}")
+        if info["type"] == "bus":
+            return self._describe_bus(info, detail)
+        else:
+            return self._describe_search(info, detail)
+
+    def _describe_single_node(self, nid: int, depth: int,
+                              detail: bool) -> str:
+        """Format the description of a single node (extracted for reuse)."""
         node = self.nodes[nid]
 
         def label(i: int) -> str:
