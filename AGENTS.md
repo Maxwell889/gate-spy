@@ -31,7 +31,7 @@ uv sync --dev
 bash install.sh
 ```
 
-这个脚本会创建 `.claude/skills/iccad22/SKILL.md`，下载 ICCAD22 测例到 `examples/ICCAD22_Problem_A/`，并生成 `.mcp.json`。它需要网络访问 Google Drive；如果只做本库代码开发或运行现有单元测试，通常先执行 `uv sync --dev` 即可。
+这个脚本会创建 `.claude/skills/iccad22/SKILL.md`，尝试从 Google Drive 下载 ICCAD22 测例，并生成 `.mcp.json`。如果下载失败，可以手动把测例放到 `examples/testcase/`；如果只做本库代码开发或运行现有单元测试，通常先执行 `uv sync --dev` 即可。
 
 运行测试：
 
@@ -81,6 +81,45 @@ scripts/v2aig.sh examples/Mul_F16.v /tmp/mul.aig
 
 涉及解析、仿真、cone 查询、子图提取或 MCP 输出格式的改动，都应补充或更新 `test/test_*.py`。随机仿真测试必须固定 `seed`。提交信息沿用当前历史中的短英文祈使句风格，例如 `add cec scripts`、`support primitive gate parser`。
 
-## 开发 Plan
+## 当前 ICCAD22 Skill 的逆向流程
 
-暂空。
+当前 `.claude/skills/iccad22/SKILL.md` 定义的是 agent 驱动的迭代式恢复流程。它本身不自动推出公式，而是指导 Claude 调用 GateSpy MCP 工具观察网表、提出 RTL 改写、再交给 CEC 验证。
+
+流程分三阶段：
+
+1. **加载与理解电路**：`read_file(path)` 解析 gate-level Verilog，建立 circuit IR，并保存当前源码。随后用 `get_node` 查看端口/内部信号，用 `find_cone` 追踪输出的 fan-in/fan-out 边界，用 `print_adder_stats` 和 `print_xor_stats` 定位加法树、CSA/CPA 结构和 XOR 链，再用 `simulate` 对少量输入模式做行为观察。
+
+2. **提出并验证 word-level 改写**：Claude 根据结构线索和仿真样本猜测表达式，例如把 adder tree 改成 `+`、乘法结构改成 `*`、MUX 改成 `?:`。改写通过 `edit` 工具提交；后端会自动运行 CEC。若 CEC 失败，改写被拒绝并返回原因或反例；若成功，记录修改并报告 cost before/after 与 reduction rate。
+
+3. **收敛与导出**：用 `show` 复查当前 RTL，用 `revert` 回退错误路径，用 `dump(output_path)` 写出最终 `*_recovered.v`。目标是在保持 CEC 等价的前提下，用更少 word-level operator 替代大量 primitive gates。
+
+这个流程的优点是灵活，能结合 LLM 的归纳能力处理未知结构；缺点是候选表达式主要靠 Claude 从工具输出中人工推断。遇到 `test04` 这类大乘加结构时，GateSpy 能显示 adder/CSA 规模并提供仿真，但不会主动给出 `out3 = in1 * (in2 + in3 + in4) + in5` 这样的候选，所以容易在猜公式和 CEC 等待中消耗时间。
+
+## 开发 Plan：LLM-Guided Hypothesis Workbench
+
+下一步不是把 WolFEx 固定模板硬编码成全自动求解器，而是把 GateSpy 做成 LLM 可驱动的网表逆向实验台。工具负责结构分析、采样、拟合、验证、反例追踪和 cost 评估；LLM 负责提出假设、发明新模板、根据 CEX 追矛盾点并调整策略。
+
+### 计划新增 MCP 工具
+
+- `infer_candidates(output="", methods=None, sample_num=256, detail=False)`：针对 PO word 生成初始候选，返回结构摘要、support words、样本匹配、cost 和 CEC 分级状态。候选只作为 LLM 的起点，不自动决定最终 rewrite。
+- `check_hypothesis(assignments, declarations="", sample_num=256, run_cec=True)`：接受 LLM 自己提出的 word-level hypothesis，例如 `{"out3": "in1 * (in2 + in3 + in4) + in5"}`。工具生成临时 RTL，显式处理位宽扩展，跑样本、CEC 和 cost，但不修改当前源码。
+- `fit_hypothesis(output, template, unknowns, sample_num=256)`：支持 LLM 自定义模板并求未知整数系数，例如 `A * (b0 + b1*B + b2*C + b3*D) + e0 + e1*E`。
+- `trace_counterexample(hypothesis_id="", output="", bits=None, depth=3)`：回放最近失败候选或指定 CEX，返回 mismatch output bits、word-level 输入值、相关 fan-in cone 和候选表达式中间项取值。
+
+### 计划实现模块
+
+新增 `src/circuit/infer/`，按职责拆分为 `words`、`sampling`、`hypothesis`、`fitting` 和 `trace`。`CircuitSession` 需要保存最近候选、样本集、CEX 和 CEC 结果，但 `edit` 仍是唯一修改当前源码的工具。
+
+CEC 状态必须分级：`proved` 表示严格证明等价，`counterexample` 表示有反例可追踪，`timeout_assumed` 只能作为候选证据，`error` 表示转换或验证失败。`edit` 计划增加 `accept_timeout=False`，默认只接受 `proved`；LLM 若要接受 timeout 候选，必须显式设置。
+
+### 计划工作流
+
+LLM 先用 `infer_candidates` 获取结构引导的初始候选。若候选不合适，直接用 `check_hypothesis` 验证自创公式；若公式有参数，用 `fit_hypothesis` 拟合；若 CEC 返回反例，用 `trace_counterexample` 定位冲突位、相关 cone 和中间项，再调整模板。最终由 LLM 组合多 PO 表达式和公共子表达式，调用 `edit(rewrite=...)` 应用 RTL，再用 `dump` 导出。
+
+### 依赖与安装计划
+
+不做运行时懒加载。计划在 `pyproject.toml` 直接加入 `numpy`、`sympy`、`pandas`、`pysr`，并扩展 `install.sh`：执行 `uv sync --dev`，检查 PySR/Julia 初始化，检查 `yosys` 和 `yosys-abc`，失败时明确报错并提示修复。不要新增批量脚本。
+
+### 测试计划
+
+单元测试覆盖 word extraction、位宽扩展、signed/unsigned 样本解释、正确/错误 hypothesis 的状态差异、线性/双线性/乘加模板拟合，以及 CEX 到 word-level mismatch 报告的转换。集成测试覆盖 test01-style 三输入加法、test03-style 加法加常数、test04-style 的 `out1 = in1 + in2`、`out2 = in3 - out1`、`out3 = in1 * (in2 + in3 + in4) + in5`。现有 MCP 工具 `read_file`、`simulate`、`find_cone`、`edit`、`dump` 必须保持兼容。
