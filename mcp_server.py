@@ -183,6 +183,73 @@ def print_adder_stats(detail: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+#  Word-level hypothesis workflow tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def infer_candidates(output: str = "",
+                     methods: list[str] | None = None,
+                     sample_num: int = 256,
+                     detail: bool = False) -> str:
+    """Generate initial word-level expression candidates for output words.
+
+    This is an LLM workbench tool, not an automatic rewrite.  It uses output
+    cones to find support input words, runs deterministic/random samples, and
+    fits built-in linear or multiplication-addition templates.  Returned
+    candidates are stored as hypotheses and should be checked/refined with
+    ``check_hypothesis`` before using ``edit``.
+    """
+    return session.infer_candidates(
+        output=output, methods=methods, sample_num=sample_num, detail=detail)
+
+
+@mcp.tool()
+def check_hypothesis(assignments: dict[str, str],
+                     declarations: str = "",
+                     sample_num: int = 256,
+                     run_cec: bool = True) -> str:
+    """Check an LLM-proposed word-level hypothesis without editing the source.
+
+    ``assignments`` maps output word names to expressions, for example
+    ``{"out3": "in1 * (in2 + in3 + in4) + in5"}``.  The tool evaluates samples
+    against the loaded gate-level circuit.  If every output word is assigned and
+    ``run_cec`` is true, it renders temporary RTL and runs CEC.  Partial-output
+    hypotheses are sample-checked but CEC is skipped.
+    """
+    return session.check_hypothesis(
+        assignments=assignments, declarations=declarations,
+        sample_num=sample_num, run_cec=run_cec,
+    )
+
+
+@mcp.tool()
+def fit_hypothesis(output: str,
+                   template: str,
+                   unknowns: list[str] | dict | None = None,
+                   sample_num: int = 256) -> str:
+    """Fit integer coefficients for an LLM-proposed expression template.
+
+    ``template`` should reference real input word names and unknown identifiers.
+    ``unknowns`` may be a list (default domains) or a mapping such as
+    ``{"c": {"min": -512, "max": 512}, "a": [-1, 0, 1]}``.
+    """
+    return session.fit_hypothesis(
+        output=output, template=template, unknowns=unknowns,
+        sample_num=sample_num,
+    )
+
+
+@mcp.tool()
+def trace_counterexample(hypothesis_id: int | str | None = None,
+                         output: str = "",
+                         bits: list[int] | None = None,
+                         depth: int = 3) -> str:
+    """Replay a failed hypothesis and report mismatch-focused debug context."""
+    return session.trace_counterexample(
+        hypothesis_id=hypothesis_id, output=output, bits=bits, depth=depth)
+
+
+# ---------------------------------------------------------------------------
 #  Code-modification workflow tools
 # ---------------------------------------------------------------------------
 
@@ -193,6 +260,7 @@ def edit(
     rewrite: str = "",
     begin: str = "",
     end: str = "",
+    accept_timeout: bool = False,
 ) -> str:
     """Apply string replacements to the current Verilog source code.
 
@@ -212,10 +280,10 @@ def edit(
        Each string in ``matches`` must appear **exactly once** in the
        current code.  Replacements are applied in order.
 
-    After applying, Yosys CEC verifies functional equivalence between the
+    After applying, ABC CEC verifies functional equivalence between the
     old and new code.  If it fails (syntax error or functional mismatch) the
     edit is **rejected** — the current code is NOT changed and nothing is
-    recorded.
+    recorded.  Timeout is also rejected unless ``accept_timeout=True`` is set.
 
     On success the ICCAD-2022-Problem-A cost is computed and the edit is
     recorded so it can be reverted later with ``revert``.
@@ -225,6 +293,7 @@ def edit(
     return session.edit(
         matches=matches, replacements=replacements,
         rewrite=rewrite, begin=begin, end=end,
+        accept_timeout=accept_timeout,
     )
 
 

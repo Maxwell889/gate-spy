@@ -31,7 +31,7 @@ uv sync --dev
 bash install.sh
 ```
 
-这个脚本会创建 `.claude/skills/iccad22/SKILL.md`，尝试从 Google Drive 下载 ICCAD22 测例，并生成 `.mcp.json`。如果下载失败，可以手动把测例放到 `examples/testcase/`；如果只做本库代码开发或运行现有单元测试，通常先执行 `uv sync --dev` 即可。
+这个脚本会安装 Python 依赖，检查并在 macOS/Homebrew 环境下自动安装缺失的 `uv`、Julia、Yosys，创建 `.claude/skills/iccad22/SKILL.md`，尝试从 Google Drive 下载 ICCAD22 测例，并生成 `.mcp.json`。如果下载失败，可以手动把测例放到 `examples/testcase/`；如果只做本库代码开发或运行现有单元测试，通常先执行 `uv sync --dev` 即可。
 
 运行测试：
 
@@ -95,31 +95,31 @@ scripts/v2aig.sh examples/Mul_F16.v /tmp/mul.aig
 
 这个流程的优点是灵活，能结合 LLM 的归纳能力处理未知结构；缺点是候选表达式主要靠 Claude 从工具输出中人工推断。遇到 `test04` 这类大乘加结构时，GateSpy 能显示 adder/CSA 规模并提供仿真，但不会主动给出 `out3 = in1 * (in2 + in3 + in4) + in5` 这样的候选，所以容易在猜公式和 CEC 等待中消耗时间。
 
-## 开发 Plan：LLM-Guided Hypothesis Workbench
+## LLM-Guided Hypothesis Workbench
 
-下一步不是把 WolFEx 固定模板硬编码成全自动求解器，而是把 GateSpy 做成 LLM 可驱动的网表逆向实验台。工具负责结构分析、采样、拟合、验证、反例追踪和 cost 评估；LLM 负责提出假设、发明新模板、根据 CEX 追矛盾点并调整策略。
+GateSpy 当前新增了一套 LLM 可驱动的网表逆向实验台。工具负责结构分析、采样、拟合、验证、反例追踪和 cost 评估；LLM 负责提出假设、发明新模板、根据 CEX 追矛盾点并调整策略。
 
-### 计划新增 MCP 工具
+### 已实现 MCP 工具
 
-- `infer_candidates(output="", methods=None, sample_num=256, detail=False)`：针对 PO word 生成初始候选，返回结构摘要、support words、样本匹配、cost 和 CEC 分级状态。候选只作为 LLM 的起点，不自动决定最终 rewrite。
-- `check_hypothesis(assignments, declarations="", sample_num=256, run_cec=True)`：接受 LLM 自己提出的 word-level hypothesis，例如 `{"out3": "in1 * (in2 + in3 + in4) + in5"}`。工具生成临时 RTL，显式处理位宽扩展，跑样本、CEC 和 cost，但不修改当前源码。
-- `fit_hypothesis(output, template, unknowns, sample_num=256)`：支持 LLM 自定义模板并求未知整数系数，例如 `A * (b0 + b1*B + b2*C + b3*D) + e0 + e1*E`。
-- `trace_counterexample(hypothesis_id="", output="", bits=None, depth=3)`：回放最近失败候选或指定 CEX，返回 mismatch output bits、word-level 输入值、相关 fan-in cone 和候选表达式中间项取值。
+- `infer_candidates(output="", methods=None, sample_num=256, detail=False)`：针对 PO word 生成初始候选，返回结构摘要、support words、样本拟合结果和 hypothesis id。当前内置线性与乘加模板，候选只作为 LLM 起点。
+- `check_hypothesis(assignments, declarations="", sample_num=256, run_cec=True)`：接受 LLM 自己提出的 word-level hypothesis，例如 `{"out3": "in1 * (in2 + in3 + in4) + in5"}`。工具跑样本检查；若覆盖所有输出，还会生成临时 RTL、显式零扩展 word 操作数、计算 cost，并按需跑 CEC。
+- `fit_hypothesis(output, template, unknowns, sample_num=256)`：支持 LLM 自定义模板并求小整数系数。`unknowns` 可以是列表，也可以用 dict 指定搜索范围。
+- `trace_counterexample(hypothesis_id="", output="", bits=None, depth=3)`：回放最近失败 hypothesis 的 CEX 或样本 mismatch，返回 mismatch output、word-level 输入值、候选表达式中间项取值和相关 cone 摘要。
 
-### 计划实现模块
+### 已实现模块
 
-新增 `src/circuit/infer/`，按职责拆分为 `words`、`sampling`、`hypothesis`、`fitting` 和 `trace`。`CircuitSession` 需要保存最近候选、样本集、CEX 和 CEC 结果，但 `edit` 仍是唯一修改当前源码的工具。
+`src/circuit/infer/` 按职责拆分为 `words`、`sampling`、`hypothesis`、`fitting` 和 `trace`。`CircuitSession` 保存最近候选、样本 mismatch、CEX 和 CEC 结果，但 `edit` 仍是唯一修改当前源码的工具。
 
-CEC 状态必须分级：`proved` 表示严格证明等价，`counterexample` 表示有反例可追踪，`timeout_assumed` 只能作为候选证据，`error` 表示转换或验证失败。`edit` 计划增加 `accept_timeout=False`，默认只接受 `proved`；LLM 若要接受 timeout 候选，必须显式设置。
+CEC 状态已分级：`proved` 表示严格证明等价，`counterexample` 表示有反例可追踪，`timeout_assumed` 只能作为候选证据，`error` 表示转换或验证失败。`edit` 已增加 `accept_timeout=False`，默认只接受 `proved`；LLM 若要接受 timeout 候选，必须显式设置。
 
 ### 计划工作流
 
 LLM 先用 `infer_candidates` 获取结构引导的初始候选。若候选不合适，直接用 `check_hypothesis` 验证自创公式；若公式有参数，用 `fit_hypothesis` 拟合；若 CEC 返回反例，用 `trace_counterexample` 定位冲突位、相关 cone 和中间项，再调整模板。最终由 LLM 组合多 PO 表达式和公共子表达式，调用 `edit(rewrite=...)` 应用 RTL，再用 `dump` 导出。
 
-### 依赖与安装计划
+### 依赖与安装
 
-不做运行时懒加载。计划在 `pyproject.toml` 直接加入 `numpy`、`sympy`、`pandas`、`pysr`，并扩展 `install.sh`：执行 `uv sync --dev`，检查 PySR/Julia 初始化，检查 `yosys` 和 `yosys-abc`，失败时明确报错并提示修复。不要新增批量脚本。
+不做运行时懒加载。`pyproject.toml` 已加入 `numpy`、`sympy`、`pandas`、`pysr`，`install.sh` 会执行 `uv sync --dev`，检查 Julia/PySR、`yosys` 和 `yosys-abc`。在 macOS 且存在 Homebrew 时，脚本会自动安装缺失的 Julia/Yosys；无法自动安装时才明确报错并提示手动命令。不要新增批量脚本。
 
-### 测试计划
+### 测试与后续增强
 
-单元测试覆盖 word extraction、位宽扩展、signed/unsigned 样本解释、正确/错误 hypothesis 的状态差异、线性/双线性/乘加模板拟合，以及 CEX 到 word-level mismatch 报告的转换。集成测试覆盖 test01-style 三输入加法、test03-style 加法加常数、test04-style 的 `out1 = in1 + in2`、`out2 = in3 - out1`、`out3 = in1 * (in2 + in3 + in4) + in5`。现有 MCP 工具 `read_file`、`simulate`、`find_cone`、`edit`、`dump` 必须保持兼容。
+新增测试覆盖候选推断、正确/错误 hypothesis 的样本状态、自定义模板拟合，以及样本 mismatch 到 trace 报告的转换。当前已验证 test01 的 CEC 路径和 test04 的样本路径：`out1 = in1 + in2`、`out2 = in3 - out1`、`out3 = in1 * (in2 + in3 + in4) + in5`。后续增强重点是接入 PySR 真实 symbolic regression、更多控制逻辑模板、跨 PO 公共子表达式优化，以及把 CEX 增量加入拟合集合。
