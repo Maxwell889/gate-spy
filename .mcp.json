@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gate-spy": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "mcp_server.py"]
+    }
+  }
+}
