@@ -16,20 +16,28 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .circuit import Circuit, extract_adders, extract_xor
 from .circuit.infer import (
     HypothesisRecord,
+    PolynomialBudget,
+    SymbolicBudget,
     check_samples,
     collect_words,
     fit_builtin_candidates,
     fit_basis_candidates,
     fit_custom_template,
+    format_strategy_report,
     format_words,
     io_words,
+    optimise_shared_wires,
+    polynomial_rewrite_word,
+    propose_output_strategy,
     render_hypothesis_rtl,
     simulate_samples,
     support_words,
+    symbolic_regression_candidates,
     trace_hypothesis_counterexample,
 )
 from .circuit.infer.words import cone_gate_histogram
@@ -816,6 +824,10 @@ class CircuitSession:
             lines.append(f"    cost          : {rec.cost}")
         if rec.note:
             lines.append(f"    note          : {rec.note}")
+        if rec.declarations.strip():
+            lines.append("    declarations:")
+            for line in rec.declarations.strip().splitlines():
+                lines.append(f"      {line}")
         lines.append("    assignments:")
         for out, expr in rec.assignments.items():
             lines.append(f"      {out} = {expr}")
@@ -842,6 +854,264 @@ class CircuitSession:
                         f"      cex mismatch: {mm['po_name']} "
                         f"old={mm['val_old']} new={mm['val_new']}"
                     )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _poly_budget_from_dict(budget: dict[str, Any] | None) -> PolynomialBudget:
+        budget = budget or {}
+        return PolynomialBudget(
+            max_nodes=int(budget.get("max_nodes", PolynomialBudget.max_nodes)),
+            max_expr_chars=int(
+                budget.get("max_expr_chars", PolynomialBudget.max_expr_chars)
+            ),
+            max_intermediate_chars=int(
+                budget.get(
+                    "max_intermediate_chars",
+                    PolynomialBudget.max_intermediate_chars,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _symbolic_budget_from_dict(budget: dict[str, Any] | None) -> SymbolicBudget:
+        budget = budget or {}
+        return SymbolicBudget(
+            max_expr_size=int(
+                budget.get("max_expr_size", SymbolicBudget.max_expr_size)
+            ),
+            beam_width=int(budget.get("beam_width", SymbolicBudget.beam_width)),
+            max_expr_chars=int(
+                budget.get("max_expr_chars", SymbolicBudget.max_expr_chars)
+            ),
+            max_inputs=int(budget.get("max_inputs", SymbolicBudget.max_inputs)),
+            max_support_bits=int(
+                budget.get(
+                    "max_support_bits",
+                    SymbolicBudget.max_support_bits,
+                )
+            ),
+            max_pair_candidates=int(
+                budget.get(
+                    "max_pair_candidates",
+                    SymbolicBudget.max_pair_candidates,
+                )
+            ),
+            max_shift=int(budget.get("max_shift", SymbolicBudget.max_shift)),
+        )
+
+    def propose_strategy(self, output: str = "",
+                         detail: bool = False,
+                         budget: dict[str, Any] | None = None) -> str:
+        """Rank template / polynomial / symbolic lanes for output recovery."""
+        c = self._current()
+        input_words, output_words = self._io_words()
+        if output and output not in output_words:
+            raise KeyError(
+                f"{output!r} is not an output word; available: "
+                + ", ".join(output_words)
+            )
+        targets = [output_words[output]] if output else list(output_words.values())
+        poly_budget = self._poly_budget_from_dict(budget)
+        strategies = [
+            propose_output_strategy(c, out_word, input_words, poly_budget)
+            for out_word in targets
+        ]
+        return format_strategy_report(strategies, detail=detail)
+
+    def run_method(self, output: str,
+                   method: str,
+                   sample_num: int = 256,
+                   budget: dict[str, Any] | None = None,
+                   detail: bool = False) -> str:
+        """Run one recovery lane without directly editing current source."""
+        method_key = method.strip().lower().replace("-", "_")
+        if method_key in {"template", "templates", "fit", "candidate"}:
+            return self.infer_candidates(
+                output=output, sample_num=sample_num, detail=detail)
+
+        c = self._current()
+        input_words, output_words = self._io_words()
+        if not output:
+            raise ValueError("run_method requires output for non-template lanes")
+        if output not in output_words:
+            raise KeyError(
+                f"{output!r} is not an output word; available: "
+                + ", ".join(output_words)
+            )
+        out_word = output_words[output]
+        support = support_words(c, out_word, input_words)
+
+        if method_key in {"polynomial", "poly", "polynomial_rewrite", "rewrite"}:
+            poly_budget = self._poly_budget_from_dict(budget)
+            estimate = propose_output_strategy(c, out_word, input_words, poly_budget)[
+                "polynomial_estimate"
+            ]
+            lines = [
+                f"Method run: polynomial_rewrite for {output}",
+                f"    estimate feasible : {estimate['feasible']}",
+                f"    estimated chars   : {estimate['estimated_chars']}",
+                f"    reconvergence     : {estimate['reconvergence']}",
+            ]
+            if not estimate["feasible"] and not (budget or {}).get("force"):
+                lines.extend([
+                    "    status            : skipped_budget",
+                    "    message           : polynomial rewrite estimate is over budget",
+                    "    next              : cut the cone, use fit_basis, try template, "
+                    "or rerun with budget={\"force\": true, ...}",
+                ])
+                for reason in estimate.get("reasons", [])[:4]:
+                    lines.append(f"      reason: {reason}")
+                return "\n".join(lines)
+
+            fit = polynomial_rewrite_word(c, out_word, poly_budget)
+            lines.append(f"    status            : {fit.get('status')}")
+            if fit.get("status") != "fit":
+                lines.append(f"    message           : {fit.get('message')}")
+                lines.append(
+                    "    next              : cut the cone, use fit_basis, or "
+                    "try symbolic with a tighter support set"
+                )
+                return "\n".join(lines)
+
+            samples = simulate_samples(
+                c, input_words, {output: out_word}, sample_num=sample_num)
+            sample_status, mismatches = check_samples(
+                {output: fit["expr"]}, "", samples, {output: out_word})
+            rec = self._next_hypothesis(
+                {output: fit["expr"]},
+                note="run_method:polynomial_rewrite",
+            )
+            rec.sample_status = sample_status
+            rec.sample_mismatches = mismatches
+            rec.cec_status = (
+                "not_run_candidate_only"
+                if sample_status == "pass"
+                else "skipped_sample_failed"
+            )
+            lines.extend([
+                f"    hypothesis #{rec.id}: {output} = {fit['expr']}",
+                f"    expr_chars        : {fit.get('expr_chars')}",
+                f"    expanded_nodes    : {fit.get('expanded_nodes')}",
+                f"    sample_status     : {sample_status}",
+                f"    cec_status        : {rec.cec_status}",
+            ])
+            if mismatches:
+                lines.append("    sample mismatches:")
+                for mm in mismatches[:4]:
+                    if "error" in mm:
+                        lines.append(f"      error: {mm['error']}")
+                    else:
+                        lines.append(
+                            f"      sample {mm['sample']} {mm['output']}: "
+                            f"expected={mm['expected']} actual={mm['actual']} "
+                            f"inputs={mm['inputs']}"
+                        )
+            return "\n".join(lines)
+
+        if method_key in {"symbolic", "symbolic_regression", "sr"}:
+            sym_budget = self._symbolic_budget_from_dict(budget)
+            samples = simulate_samples(
+                c, input_words, {output: out_word}, sample_num=sample_num)
+            fit = symbolic_regression_candidates(
+                samples, out_word, support, budget=sym_budget)
+            lines = [
+                f"Method run: symbolic_regression for {output}",
+                f"    support : {format_words(support)}",
+                f"    status  : {fit.get('status')}",
+                f"    samples : {fit.get('samples', sample_num)}",
+            ]
+            if fit.get("status") == "fit":
+                rec = self._next_hypothesis(
+                    {output: fit["expr"]},
+                    note="run_method:symbolic_regression",
+                )
+                rec.sample_status = "pass"
+                rec.cec_status = "not_run_candidate_only"
+                lines.extend([
+                    f"    hypothesis #{rec.id}: {output} = {fit['expr']}",
+                    f"    expr_size : {fit.get('expr_size')}",
+                    "    next      : combine with other outputs and run "
+                    "check_hypothesis for CEC refinement",
+                ])
+            else:
+                msg = fit.get("message")
+                if msg:
+                    lines.append(f"    message : {msg}")
+                if fit.get("nearest"):
+                    lines.append("    nearest sample matches:")
+                    for item in fit["nearest"]:
+                        lines.append(
+                            f"      {item['matching_samples']}/{fit.get('samples', sample_num)} "
+                            f"size={item['expr_size']} expr={item['expr']}"
+                        )
+                lines.append(
+                    "    next    : add LLM-designed basis terms, increase budget, "
+                    "or use trace_counterexample after a failed full hypothesis"
+                )
+            return "\n".join(lines)
+
+        raise ValueError(
+            "unknown method; use template, polynomial, or symbolic"
+        )
+
+    def explain_failure(self, hypothesis_id: int | str | None = None,
+                        output: str = "",
+                        depth: int = 3) -> str:
+        """Explain the latest failed hypothesis and suggest next method steps."""
+        rec = self._find_hypothesis(hypothesis_id)
+        if rec is None:
+            return "No hypotheses have been checked yet."
+        lines = [
+            f"Failure analysis for hypothesis #{rec.id}",
+            f"    sample_status : {rec.sample_status}",
+            f"    cec_status    : {rec.cec_status}",
+        ]
+        if rec.note:
+            lines.append(f"    note          : {rec.note}")
+        if rec.sample_status == "mismatch":
+            lines.append(
+                "    diagnosis     : the expression is already contradicted by "
+                "samples; inspect missing terms, selector polarity, constants, "
+                "and output width before running CEC again"
+            )
+        elif rec.cec_status == "counterexample":
+            lines.append(
+                "    diagnosis     : samples passed but formal CEC found a "
+                "counterexample; use the CEX as a new targeted sample and "
+                "adjust basis/template around the mismatching bit"
+            )
+        elif rec.cec_status == "timeout_assumed":
+            lines.append(
+                "    diagnosis     : timeout is not proof; reduce expression "
+                "complexity, split outputs, or seek a cheaper shared form"
+            )
+        elif rec.cec_status == "error":
+            lines.append(
+                "    diagnosis     : verification or RTL rendering failed; "
+                "check syntax, widths, and unsupported operators first"
+            )
+        else:
+            lines.append(
+                "    diagnosis     : no hard failure is recorded; use cost audit "
+                "or a stricter full-output check if the expression looks bloated"
+            )
+
+        lines.append("")
+        lines.append(trace_hypothesis_counterexample(
+            self._current(),
+            rec,
+            *self._io_words(),
+            output=output,
+            depth=depth,
+        ))
+        lines.extend([
+            "",
+            "Suggested next actions:",
+            "  1. If mismatch is a constant/weight error, use fit_basis with the missing term.",
+            "  2. If mismatch follows a selector, add explicit MUX basis terms or run polynomial on the selected output.",
+            "  3. If polynomial explodes, cut the cone or use symbolic regression on a smaller support set.",
+            "  4. After any correction, rerun check_hypothesis with CEC before edit.",
+        ])
         return "\n".join(lines)
 
     def infer_candidates(self, output: str = "",
@@ -969,7 +1239,8 @@ class CircuitSession:
     def check_hypothesis(self, assignments: dict[str, str],
                          declarations: str = "",
                          sample_num: int = 256,
-                         run_cec: bool = True) -> str:
+                         run_cec: bool = True,
+                         share_common: bool = True) -> str:
         """Check an LLM-proposed hypothesis without modifying current source."""
         if not self._current_code:
             raise RuntimeError("no Verilog code loaded; call read_file(path) first")
@@ -1006,9 +1277,48 @@ class CircuitSession:
             rec.note = "CEC skipped because sample checking did not pass"
             return self._format_hypothesis(rec)
 
+        use_compact_widths = False
+        if share_common:
+            opt_declarations, opt_assignments, opt_stats = optimise_shared_wires(
+                assignments, declarations, input_words, output_words)
+            if opt_stats.get("shared_count"):
+                opt_status, opt_mismatches = check_samples(
+                    opt_assignments, opt_declarations, samples, output_words)
+                if opt_status == "pass":
+                    rec.declarations = opt_declarations
+                    rec.assignments = opt_assignments
+                    shared = ", ".join(
+                        f"{item['name']}={item['expr']}"
+                        for item in opt_stats.get("shared_wires", [])[:8]
+                    )
+                    suffix = "" if len(opt_stats.get("shared_wires", [])) <= 8 else ", ..."
+                    rec.note = (
+                        f"shared {opt_stats['shared_count']} common expression(s): "
+                        + shared
+                        + suffix
+                    )
+                    assignments = opt_assignments
+                    declarations = opt_declarations
+                    use_compact_widths = True
+                else:
+                    rec.note = "shared-wire optimization skipped because sample check failed"
+                    rec.sample_mismatches = opt_mismatches
+
         rec.rtl = render_hypothesis_rtl(
-            c.name or "top", input_words, output_words, assignments, declarations)
-        rec.cost = self._compute_cost(rec.rtl)
+            c.name or "top", input_words, output_words, assignments, declarations,
+            extend_widths=not use_compact_widths)
+        cost_rtl = render_hypothesis_rtl(
+            c.name or "top", input_words, output_words, assignments, declarations,
+            extend_widths=False)
+        rec.cost = self._compute_cost(cost_rtl)
+        if not use_compact_widths:
+            proof_cost = self._compute_cost(rec.rtl)
+            if proof_cost != rec.cost:
+                cost_note = (
+                    "cost computed on compact RTL; CEC RTL with explicit "
+                    f"width extensions would cost {proof_cost}"
+                )
+                rec.note = f"{rec.note}; {cost_note}" if rec.note else cost_note
 
         if run_cec:
             rec.cec = self._run_cec(self._current_code, rec.rtl)

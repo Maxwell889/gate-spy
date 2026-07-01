@@ -2,13 +2,18 @@
 
 from src.session import CircuitSession
 from src.circuit.infer import (
+    PolynomialBudget,
+    SymbolicBudget,
     Sample,
     Word,
     fit_basis_candidates,
     fit_builtin_candidates,
     fit_custom_template,
+    optimise_shared_wires,
+    polynomial_rewrite_word,
+    symbolic_regression_candidates,
 )
-from src.circuit.infer.hypothesis import eval_expr
+from src.circuit.infer.hypothesis import check_samples, eval_expr
 
 
 def word(name, width):
@@ -76,6 +81,66 @@ def test_check_hypothesis_samples_pass_and_fail():
     )
     assert "sample_status : mismatch" in bad
     assert "sample mismatches:" in bad
+
+
+def test_check_hypothesis_reports_compact_cost_for_selector_factoring():
+    session = CircuitSession()
+    session.load("examples/testcase/test07/top_primitive.v")
+
+    report = session.check_hypothesis(
+        {"out1": "in4 ? ((in4[1] ? in1 : in3) * (in4[0] ? in2 : in3)) : 0"},
+        sample_num=64,
+        run_cec=False,
+    )
+
+    assert "sample_status : pass" in report
+    assert "cost          : 6" in report
+    assert "width extensions would cost 14" in report
+
+
+def test_optimise_shared_wires_extracts_test19_style_bases():
+    inputs = {
+        "in1": word("in1", 1),
+        "in2": word("in2", 2),
+        "in5": word("in5", 5),
+        "in8": word("in8", 2),
+        "s1": word("s1", 1),
+        "s2": word("s2", 1),
+    }
+    outputs = {
+        "out1": word("out1", 7),
+        "out2": word("out2", 7),
+    }
+    assignments = {
+        "out1": "s1 ? (in1 + in2 + 24 * in8 + in5) : (in1 + in2 + 24 * in8)",
+        "out2": "s2 ? (in1 + in2 + 24 * in8 + in5) : (in1 + in2 + 24 * in8)",
+    }
+
+    declarations, shared_assignments, stats = optimise_shared_wires(
+        assignments, "", inputs, outputs)
+
+    assert stats["shared_count"] >= 3
+    assert "assign gs_cse0 = in1 + in2;" in declarations
+    assert any("24 * in8" in item["expr"] for item in stats["shared_wires"])
+    samples = synthetic_samples(list(inputs.values()), outputs["out1"], lambda r: 0, values=range(4))
+    samples = [
+        Sample(
+            inputs=s.inputs,
+            outputs={
+                "out1": ((s.inputs["in1"] + s.inputs["in2"] + 24 * s.inputs["in8"] + s.inputs["in5"])
+                         if s.inputs["s1"] else
+                         (s.inputs["in1"] + s.inputs["in2"] + 24 * s.inputs["in8"])) & outputs["out1"].mask,
+                "out2": ((s.inputs["in1"] + s.inputs["in2"] + 24 * s.inputs["in8"] + s.inputs["in5"])
+                         if s.inputs["s2"] else
+                         (s.inputs["in1"] + s.inputs["in2"] + 24 * s.inputs["in8"])) & outputs["out2"].mask,
+            },
+            input_bits={},
+            output_bits={},
+        )
+        for s in samples
+    ]
+    status, mismatches = check_samples(shared_assignments, declarations, samples, outputs)
+    assert status == "pass", mismatches
 
 
 def test_fit_hypothesis_custom_constant_template():
@@ -298,3 +363,130 @@ def test_sample_evaluator_supports_ternary_and_bit_selects():
     assert eval_expr("sel ? a[3:1] : b", env) == 0b101
     assert eval_expr("!sel ? b : c[0]", env) == 1
     assert eval_expr("(sel ? a : b) + 4", env) == 15
+
+
+def test_propose_strategy_lists_three_recovery_lanes():
+    session = CircuitSession()
+    session.load("examples/iccad22_test01.v")
+
+    report = session.propose_strategy(output="out1", detail=True)
+
+    assert "Three-lane recovery strategy" in report
+    assert "1. template" in report
+    assert "2. polynomial" in report
+    assert "3. symbolic" in report
+    assert 'run_method(output="out1", method="template")' in report
+
+
+def test_polynomial_rewrite_word_builds_sample_checked_hypothesis():
+    session = CircuitSession()
+    session.load("examples/iccad22_test01.v")
+    circuit = session._current()
+    _, outputs = session._io_words()
+
+    fit = polynomial_rewrite_word(
+        circuit,
+        outputs["out1"],
+        PolynomialBudget(max_nodes=256, max_expr_chars=24000),
+    )
+
+    assert fit["status"] == "fit"
+    assert fit["output"] == "out1"
+    report = session.run_method(
+        output="out1",
+        method="polynomial",
+        sample_num=32,
+        budget={"max_nodes": 256, "max_expr_chars": 24000},
+    )
+    assert "Method run: polynomial_rewrite for out1" in report
+    assert "sample_status     : pass" in report
+
+
+def test_symbolic_regression_finds_small_arithmetic_expression():
+    a = word("a", 4)
+    b = word("b", 4)
+    c = word("c", 4)
+    out = word("y", 5)
+    samples = synthetic_samples(
+        [a, b, c],
+        out,
+        lambda r: r["a"] + r["b"] + r["c"],
+        values=range(4),
+    )
+
+    fit = symbolic_regression_candidates(
+        samples,
+        out,
+        [a, b, c],
+        budget=SymbolicBudget(max_expr_size=5, beam_width=128),
+    )
+
+    assert fit["status"] == "fit"
+    assert all(
+        (eval_expr(fit["expr"], dict(sample.inputs)) & out.mask)
+        == sample.outputs[out.name]
+        for sample in samples
+    )
+
+
+def test_run_symbolic_method_records_candidate():
+    session = CircuitSession()
+    session.load("examples/iccad22_test01.v")
+
+    report = session.run_method(
+        output="out1",
+        method="symbolic",
+        sample_num=48,
+        budget={"max_expr_size": 5, "beam_width": 256},
+    )
+
+    assert "Method run: symbolic_regression for out1" in report
+    assert "status  : fit" in report
+    assert "hypothesis #" in report
+
+
+def test_symbolic_method_uses_product_shift_probe_on_wide_words():
+    session = CircuitSession()
+    session.load("examples/release/test09/top_primitive.v")
+
+    report = session.run_method(
+        output="out2",
+        method="symbolic",
+        sample_num=256,
+    )
+
+    assert "Method run: symbolic_regression for out2" in report
+    assert "status  : fit" in report
+    assert "out2 = (in1 * in3 + in2) >> 5" in report
+
+
+def test_polynomial_method_skips_infeasible_rewrite_unless_forced():
+    session = CircuitSession()
+    session.load("examples/release/test09/top_primitive.v")
+
+    report = session.run_method(
+        output="out2",
+        method="polynomial",
+        sample_num=16,
+    )
+
+    assert "Method run: polynomial_rewrite for out2" in report
+    assert "status            : skipped_budget" in report
+    assert "polynomial rewrite estimate is over budget" in report
+
+
+def test_explain_failure_wraps_trace_and_next_actions():
+    session = CircuitSession()
+    session.load("examples/iccad22_test01.v")
+    session.check_hypothesis(
+        {"out1": "in1 + in2"},
+        sample_num=64,
+        run_cec=False,
+    )
+
+    report = session.explain_failure(output="out1", depth=2)
+
+    assert "Failure analysis for hypothesis" in report
+    assert "diagnosis" in report
+    assert "Counterexample trace" in report
+    assert "Suggested next actions:" in report

@@ -187,6 +187,57 @@ def print_adder_stats(detail: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+def propose_strategy(output: str = "",
+                     detail: bool = False,
+                     budget: dict | None = None) -> str:
+    """Rank recovery lanes for one or all output words.
+
+    The report compares three methods:
+    1. template/basis fitting,
+    2. bounded polynomial rewrite,
+    3. symbolic regression with CEC-driven refinement.
+
+    ``budget`` may set polynomial limits such as ``max_nodes`` and
+    ``max_expr_chars``.  This tool does not create hypotheses or edit code; it
+    tells the LLM which lane to try next and why.
+    """
+    return session.propose_strategy(
+        output=output, detail=detail, budget=budget)
+
+
+@mcp.tool()
+def run_method(output: str,
+               method: str,
+               sample_num: int = 256,
+               budget: dict | None = None,
+               detail: bool = False) -> str:
+    """Run one recovery lane without editing source code.
+
+    ``method`` accepts ``template``, ``polynomial``, or ``symbolic``.
+    Template delegates to ``infer_candidates``.  Polynomial expands a bounded
+    PO-to-PI expression and sample-checks it.  Symbolic regression runs a small
+    deterministic grammar search on samples.  Returned expressions are stored as
+    hypotheses; use ``check_hypothesis`` or ``edit`` for formal proof.
+    """
+    return session.run_method(
+        output=output,
+        method=method,
+        sample_num=sample_num,
+        budget=budget,
+        detail=detail,
+    )
+
+
+@mcp.tool()
+def explain_failure(hypothesis_id: int | str | None = None,
+                    output: str = "",
+                    depth: int = 3) -> str:
+    """Analyze a failed hypothesis and recommend the next recovery action."""
+    return session.explain_failure(
+        hypothesis_id=hypothesis_id, output=output, depth=depth)
+
+
+@mcp.tool()
 def infer_candidates(output: str = "",
                      methods: list[str] | None = None,
                      sample_num: int = 256,
@@ -208,18 +259,22 @@ def infer_candidates(output: str = "",
 def check_hypothesis(assignments: dict[str, str],
                      declarations: str = "",
                      sample_num: int = 256,
-                     run_cec: bool = True) -> str:
+                     run_cec: bool = True,
+                     share_common: bool = True) -> str:
     """Check an LLM-proposed word-level hypothesis without editing the source.
 
     ``assignments`` maps output word names to expressions, for example
     ``{"out3": "in1 * (in2 + in3 + in4) + in5"}``.  The tool evaluates samples
-    against the loaded gate-level circuit.  If every output word is assigned and
-    ``run_cec`` is true, it renders temporary RTL and runs CEC.  Partial-output
-    hypotheses are sample-checked but CEC is skipped.
+    against the loaded gate-level circuit.  With ``share_common=True`` it
+    conservatively extracts repeated additive subexpressions into local wires,
+    re-checks samples, and then computes cost/CEC on the shared form.  If every
+    output word is assigned and ``run_cec`` is true, it renders temporary RTL
+    and runs CEC.  Partial-output hypotheses are sample-checked but CEC is
+    skipped.
     """
     return session.check_hypothesis(
         assignments=assignments, declarations=declarations,
-        sample_num=sample_num, run_cec=run_cec,
+        sample_num=sample_num, run_cec=run_cec, share_common=share_common,
     )
 
 

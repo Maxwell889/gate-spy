@@ -240,6 +240,13 @@ def _extend_name(name: str, width: int, target_width: int) -> str:
 def extend_expr_width(expr: str, widths: dict[str, int], target_width: int) -> str:
     """Zero-extend known word identifiers for safer Verilog expression width."""
     keywords = {"assign", "wire", "reg", "logic", "input", "output", "signed", "unsigned"}
+    found = _find_top_level_ternary(expr)
+    if found is not None:
+        qpos, cpos = found
+        cond = expr[:qpos].strip()
+        true_expr = extend_expr_width(expr[qpos + 1:cpos].strip(), widths, target_width)
+        false_expr = extend_expr_width(expr[cpos + 1:].strip(), widths, target_width)
+        return f"{cond} ? ({true_expr}) : ({false_expr})"
     if target_width <= 1 and re.search(r"[?:]|[<>]=?|==|!=", expr):
         return expr
 
@@ -254,7 +261,155 @@ def extend_expr_width(expr: str, widths: dict[str, int], target_width: int) -> s
     return _IDENT_RE.sub(repl, expr)
 
 
-def _render_user_declarations(declarations: str, widths: dict[str, int]) -> str:
+def _strip_outer_parens(expr: str) -> str:
+    expr = expr.strip()
+    changed = True
+    while changed and expr.startswith("(") and expr.endswith(")"):
+        changed = False
+        depth = 0
+        for idx, ch in enumerate(expr):
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0 and idx != len(expr) - 1:
+                    break
+        else:
+            expr = expr[1:-1].strip()
+            changed = True
+    return expr
+
+
+def _split_top_level(expr: str, sep: str = "+") -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(expr):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(expr[start:idx].strip())
+            start = idx + 1
+    parts.append(expr[start:].strip())
+    return [part for part in parts if part]
+
+
+def _normalise_sum_expr(expr: str) -> str:
+    return " + ".join(_split_top_level(_strip_outer_parens(expr), "+"))
+
+
+def _iter_branch_exprs(expr: str) -> list[str]:
+    expr = _strip_outer_parens(expr)
+    found = _find_top_level_ternary(expr)
+    if found is None:
+        return [expr]
+    qpos, cpos = found
+    return (
+        _iter_branch_exprs(expr[qpos + 1:cpos])
+        + _iter_branch_exprs(expr[cpos + 1:])
+    )
+
+
+def _sum_prefixes(expr: str) -> list[str]:
+    parts = _split_top_level(_strip_outer_parens(expr), "+")
+    if len(parts) < 2:
+        return []
+    return [" + ".join(parts[:idx]) for idx in range(2, len(parts) + 1)]
+
+
+def _sum_term_count(expr: str) -> int:
+    return len(_split_top_level(_strip_outer_parens(expr), "+"))
+
+
+def optimise_shared_wires(assignments: dict[str, str],
+                          declarations: str,
+                          input_words: dict[str, Word],
+                          output_words: dict[str, Word],
+                          min_occurrences: int = 2
+                          ) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Extract repeated additive subexpressions into local wires.
+
+    This is deliberately conservative: it only shares top-level ``+`` prefixes
+    found inside assignment branches.  It is meant to capture contest-style
+    repeated arithmetic bases without attempting a full Verilog AST rewrite.
+    """
+    existing = {
+        *input_words.keys(),
+        *output_words.keys(),
+        *parse_local_widths(declarations).keys(),
+    }
+    counts: dict[str, int] = {}
+    widths: dict[str, int] = {}
+
+    for out_name, expr in assignments.items():
+        out_width = output_words[out_name].width
+        for branch in _iter_branch_exprs(expr):
+            for prefix in _sum_prefixes(branch):
+                norm = _normalise_sum_expr(prefix)
+                if _sum_term_count(norm) < 2:
+                    continue
+                counts[norm] = counts.get(norm, 0) + 1
+                widths[norm] = max(widths.get(norm, 1), out_width)
+
+    selected = [
+        expr for expr, count in counts.items()
+        if count >= min_occurrences and _sum_term_count(expr) >= 2
+    ]
+    selected.sort(key=lambda expr: (_sum_term_count(expr), len(expr), expr))
+
+    rendered_exprs: dict[str, str] = {}
+    name_for_expr: dict[str, str] = {}
+    wire_lines: list[str] = []
+    assign_lines: list[str] = []
+    for idx, expr in enumerate(selected):
+        name = f"gs_cse{idx}"
+        while name in existing:
+            idx += 1
+            name = f"gs_cse{idx}"
+        existing.add(name)
+        rhs = expr
+        for old, old_name in sorted(rendered_exprs.items(), key=lambda kv: -len(kv[0])):
+            rhs = rhs.replace(old, old_name)
+        width = widths.get(expr, 1)
+        wire_lines.append(f"wire [{width - 1}:0] {name};" if width > 1 else f"wire {name};")
+        assign_lines.append(f"assign {name} = {rhs};")
+        rendered_exprs[expr] = name
+        name_for_expr[expr] = name
+
+    if not name_for_expr:
+        return declarations, dict(assignments), {
+            "shared_count": 0,
+            "shared_wires": [],
+        }
+
+    def replace_expr(expr: str) -> str:
+        out = expr
+        for old, name in sorted(name_for_expr.items(), key=lambda kv: -len(kv[0])):
+            out = out.replace(old, name)
+        return out
+
+    new_assignments = {
+        out_name: replace_expr(expr)
+        for out_name, expr in assignments.items()
+    }
+    shared_decl = "\n".join([*wire_lines, *assign_lines])
+    new_declarations = "\n".join(
+        part for part in [declarations.strip(), shared_decl] if part
+    )
+    return new_declarations, new_assignments, {
+        "shared_count": len(name_for_expr),
+        "shared_wires": [
+            {"name": name, "expr": expr, "width": widths.get(expr, 1), "uses": counts.get(expr, 0)}
+            for expr, name in name_for_expr.items()
+        ],
+    }
+
+
+def _render_user_declarations(declarations: str,
+                              widths: dict[str, int],
+                              extend_widths: bool = True) -> str:
     if not declarations.strip():
         return ""
 
@@ -268,7 +423,8 @@ def _render_user_declarations(declarations: str, widths: dict[str, int]) -> str:
             out.append(before)
         lhs, rhs = m.group(1).strip(), m.group(2).strip()
         target_width = local_widths.get(lhs, widths.get(lhs, 0))
-        rhs = extend_expr_width(rhs, render_widths, target_width) if target_width else rhs
+        if extend_widths and target_width:
+            rhs = extend_expr_width(rhs, render_widths, target_width)
         out.append(f"assign {lhs} = {rhs};")
         pos = m.end()
     tail = declarations[pos:].strip()
@@ -281,7 +437,8 @@ def render_hypothesis_rtl(module_name: str,
                           input_words: dict[str, Word],
                           output_words: dict[str, Word],
                           assignments: dict[str, str],
-                          declarations: str = "") -> str:
+                          declarations: str = "",
+                          extend_widths: bool = True) -> str:
     """Render a temporary word-level RTL module for hypothesis checking."""
     missing = [name for name in output_words if name not in assignments]
     if missing:
@@ -299,11 +456,13 @@ def render_hypothesis_rtl(module_name: str,
     lines = [f"module {module_name}({', '.join(ports)});"]
     lines.extend(_decl("input", word) for word in input_words.values())
     lines.extend(_decl("output", word) for word in output_words.values())
-    rendered_decl = _render_user_declarations(declarations, widths)
+    rendered_decl = _render_user_declarations(declarations, widths, extend_widths)
     if rendered_decl:
         lines.append(rendered_decl)
     for out_name, word in output_words.items():
-        expr = extend_expr_width(assignments[out_name], widths, word.width)
+        expr = assignments[out_name]
+        if extend_widths:
+            expr = extend_expr_width(expr, widths, word.width)
         lines.append(f"  assign {out_name} = {expr};")
     lines.append("endmodule")
     return "\n".join(lines) + "\n"
