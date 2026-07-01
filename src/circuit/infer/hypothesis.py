@@ -42,18 +42,93 @@ def _verilog_number_to_int(match: re.Match) -> str:
 
 
 def _to_python_expr(expr: str) -> str:
-    if "?" in expr:
-        raise ValueError("sample evaluator does not support Verilog ternary ?: yet")
     expr = _SIZED_NUM_RE.sub(_verilog_number_to_int, expr)
+    expr = _convert_bit_selects(expr)
+    expr = _convert_ternary(expr)
     expr = re.sub(r"\$(signed|unsigned)\s*\(", "(", expr)
     expr = expr.replace("&&", " and ").replace("||", " or ")
     expr = re.sub(r"(?<![=!<>])!(?!=)", " not ", expr)
     return expr
 
 
+def _convert_bit_selects(expr: str) -> str:
+    expr = re.sub(
+        r"\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*:\s*(\d+)\s*\]",
+        lambda m: f"bitsel({m.group(1)}, {m.group(2)}, {m.group(3)})",
+        expr,
+    )
+    expr = re.sub(
+        r"\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]",
+        lambda m: f"bitsel({m.group(1)}, {m.group(2)}, {m.group(2)})",
+        expr,
+    )
+    return expr
+
+
+def _find_top_level_ternary(expr: str) -> tuple[int, int] | None:
+    depth = 0
+    qpos = -1
+    nested = 0
+    for i, ch in enumerate(expr):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and ch == "?":
+            if qpos == -1:
+                qpos = i
+            else:
+                nested += 1
+        elif depth == 0 and ch == ":" and qpos != -1:
+            if nested:
+                nested -= 1
+            else:
+                return qpos, i
+    return None
+
+
+def _convert_parenthesized_ternaries(expr: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(expr):
+        if expr[i] != "(":
+            out.append(expr[i])
+            i += 1
+            continue
+
+        depth = 1
+        j = i + 1
+        while j < len(expr) and depth:
+            if expr[j] == "(":
+                depth += 1
+            elif expr[j] == ")":
+                depth -= 1
+            j += 1
+        if depth:
+            out.append(expr[i])
+            i += 1
+            continue
+        inner = expr[i + 1:j - 1]
+        out.append(f"({_convert_ternary(inner)})")
+        i = j
+    return "".join(out)
+
+
+def _convert_ternary(expr: str) -> str:
+    expr = _convert_parenthesized_ternaries(expr)
+    found = _find_top_level_ternary(expr)
+    if found is None:
+        return expr
+    qpos, cpos = found
+    cond = _convert_ternary(expr[:qpos].strip())
+    true_expr = _convert_ternary(expr[qpos + 1:cpos].strip())
+    false_expr = _convert_ternary(expr[cpos + 1:].strip())
+    return f"(({true_expr}) if ({cond}) else ({false_expr}))"
+
+
 _ALLOWED_NODES = {
     ast.Expression, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
-    ast.Name, ast.Load, ast.Constant,
+    ast.Name, ast.Load, ast.Constant, ast.IfExp, ast.Call,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
     ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor, ast.Invert,
     ast.UAdd, ast.USub, ast.Not, ast.And, ast.Or,
@@ -68,9 +143,21 @@ def eval_expr(expr: str, env: dict[str, int]) -> int:
     for node in ast.walk(tree):
         if type(node) not in _ALLOWED_NODES:
             raise ValueError(f"unsupported expression construct: {type(node).__name__}")
-        if isinstance(node, ast.Name) and node.id not in env:
+        if isinstance(node, ast.Name) and node.id != "bitsel" and node.id not in env:
             raise KeyError(f"unknown identifier {node.id!r} in expression {expr!r}")
-    value = eval(compile(tree, "<hypothesis>", "eval"), {"__builtins__": {}}, env)
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id != "bitsel":
+                raise ValueError("only bitsel() calls are allowed in expressions")
+
+    def bitsel(value: int, hi: int, lo: int) -> int:
+        hi_i, lo_i = int(hi), int(lo)
+        if hi_i < lo_i:
+            hi_i, lo_i = lo_i, hi_i
+        return (int(value) >> lo_i) & ((1 << (hi_i - lo_i + 1)) - 1)
+
+    safe_env = dict(env)
+    safe_env["bitsel"] = bitsel
+    value = eval(compile(tree, "<hypothesis>", "eval"), {"__builtins__": {}}, safe_env)
     return int(value)
 
 
@@ -153,9 +240,13 @@ def _extend_name(name: str, width: int, target_width: int) -> str:
 def extend_expr_width(expr: str, widths: dict[str, int], target_width: int) -> str:
     """Zero-extend known word identifiers for safer Verilog expression width."""
     keywords = {"assign", "wire", "reg", "logic", "input", "output", "signed", "unsigned"}
+    if target_width <= 1 and re.search(r"[?:]|[<>]=?|==|!=", expr):
+        return expr
 
     def repl(m: re.Match) -> str:
         name = m.group(0)
+        if m.end() < len(expr) and expr[m.end()] == "[":
+            return name
         if name in keywords or name not in widths:
             return name
         return _extend_name(name, widths[name], target_width)

@@ -23,6 +23,7 @@ from .circuit.infer import (
     check_samples,
     collect_words,
     fit_builtin_candidates,
+    fit_basis_candidates,
     fit_custom_template,
     format_words,
     io_words,
@@ -863,12 +864,32 @@ class CircuitSession:
             f"    outputs : {format_words(list(output_words.values()))}",
             f"    samples : {sample_num}",
         ]
+        fit_methods = methods
+        if not output and methods is None and len(targets) > 12:
+            fit_methods = [
+                "linear",
+                "affine",
+                "scale_shift",
+                "bitselect",
+                "compare",
+                "mux",
+            ]
+            lines.append(
+                "    batch_methods : fast "
+                "(linear, affine, scale_shift, bitselect, compare, mux)"
+            )
+        batch_assignments: dict[str, str] = {}
+        missing_batch_outputs: list[str] = []
+        shared_samples = (
+            simulate_samples(c, input_words, output_words, sample_num=sample_num)
+            if not output else None
+        )
         for out_word in targets:
             support = support_words(c, out_word, input_words)
             hist = cone_gate_histogram(c, out_word)
-            samples = simulate_samples(
+            samples = shared_samples or simulate_samples(
                 c, input_words, {out_word.name: out_word}, sample_num=sample_num)
-            candidates = fit_builtin_candidates(samples, out_word, support, methods)
+            candidates = fit_builtin_candidates(samples, out_word, support, fit_methods)
             hist_text = ", ".join(f"{k}:{v}" for k, v in hist.items()) or "(none)"
             lines.extend([
                 "",
@@ -878,7 +899,11 @@ class CircuitSession:
             ])
             if not candidates:
                 lines.append("candidates: none fitted; try check_hypothesis or fit_hypothesis with a custom template")
+                if not output:
+                    missing_batch_outputs.append(out_word.name)
                 continue
+            if not output:
+                batch_assignments[out_word.name] = candidates[0]["expr"]
             for cand in candidates[:6 if detail else 3]:
                 rec = self._next_hypothesis(
                     {out_word.name: cand["expr"]},
@@ -895,6 +920,50 @@ class CircuitSession:
                     for key, value in cand.items():
                         if key not in {"expr", "method", "output"}:
                             lines.append(f"  {key}: {value}")
+        if not output and batch_assignments:
+            samples = shared_samples or simulate_samples(
+                c, input_words, output_words, sample_num=sample_num)
+            sample_status, mismatches = check_samples(
+                batch_assignments, "", samples, output_words)
+            rec = self._next_hypothesis(
+                batch_assignments,
+                note="infer_candidates:batch_top",
+            )
+            rec.sample_status = sample_status
+            rec.sample_mismatches = mismatches
+            rec.cec_status = (
+                "not_run_candidate_only"
+                if sample_status == "pass"
+                else "skipped_sample_failed"
+            )
+            if missing_batch_outputs:
+                rec.note = (
+                    "batch top candidates missing outputs: "
+                    + ", ".join(missing_batch_outputs)
+                )
+            lines.extend([
+                "",
+                "== batch top assignments ==",
+                f"hypothesis #{rec.id}",
+                f"assigned_outputs : {len(batch_assignments)}/{len(output_words)}",
+                f"sample_status    : {sample_status}",
+                f"cec_status       : {rec.cec_status}",
+            ])
+            if missing_batch_outputs:
+                lines.append("missing_outputs  : " + ", ".join(missing_batch_outputs))
+            if mismatches:
+                lines.append("sample mismatches:")
+                for mm in mismatches[:4]:
+                    if "error" in mm:
+                        lines.append(f"  error: {mm['error']}")
+                    else:
+                        lines.append(
+                            f"  sample {mm['sample']} {mm['output']}: "
+                            f"expected={mm['expected']} actual={mm['actual']} "
+                            f"inputs={mm['inputs']}"
+                        )
+            lines.append("assignments_json:")
+            lines.append(json.dumps(batch_assignments, indent=2, sort_keys=True))
         return "\n".join(lines)
 
     def check_hypothesis(self, assignments: dict[str, str],
@@ -976,6 +1045,51 @@ class CircuitSession:
             rec.cec_status = "not_run_candidate_only"
             lines.append(f"    hypothesis #{rec.id}: {output} = {fit['expr']}")
             lines.append(f"    coefficients : {fit.get('coefficients')}")
+        else:
+            msg = fit.get("message")
+            if msg:
+                lines.append(f"    message : {msg}")
+        return "\n".join(lines)
+
+    def fit_basis(self, output: str, basis: list[str],
+                  include_constant: bool = True,
+                  coefficient_limit: int = 4096,
+                  sample_num: int = 256) -> str:
+        """Fit an LLM-supplied linear combination of arbitrary basis terms."""
+        c = self._current()
+        input_words, output_words = self._io_words()
+        if output not in output_words:
+            raise KeyError(
+                f"{output!r} is not an output word; available: "
+                + ", ".join(output_words)
+            )
+        samples = simulate_samples(
+            c, input_words, {output: output_words[output]}, sample_num=sample_num)
+        fit = fit_basis_candidates(
+            samples,
+            output_words[output],
+            basis,
+            include_constant=include_constant,
+            coefficient_limit=coefficient_limit,
+        )
+        lines = [
+            f"Basis fit for {output}",
+            f"    status  : {fit.get('status')}",
+            f"    samples : {fit.get('samples', sample_num)}",
+        ]
+        if fit.get("status") == "fit":
+            rec = self._next_hypothesis(
+                {output: fit["expr"]},
+                note="fit_basis:llm_basis",
+            )
+            rec.sample_status = "pass"
+            rec.cec_status = "not_run_candidate_only"
+            lines.append(f"    hypothesis #{rec.id}: {output} = {fit['expr']}")
+            lines.append(f"    constant : {fit.get('constant')}")
+            lines.append("    coefficients:")
+            for basis_expr, coeff in fit.get("coefficients", {}).items():
+                if coeff:
+                    lines.append(f"      {coeff} * ({basis_expr})")
         else:
             msg = fit.get("message")
             if msg:
@@ -1253,7 +1367,53 @@ class CircuitSession:
                  "--timeout", "310"],
                 capture_output=True, text=True, timeout=320,
             )
-            return json.loads(proc.stdout.strip())
+            result = json.loads(proc.stdout.strip())
+            if result.get("reason") == "counterexample":
+                yosys_cec = str(
+                    Path(__file__).resolve().parents[1]
+                    / "scripts"
+                    / "yosys_cec.py"
+                )
+                yproc = subprocess.run(
+                    ["python", yosys_cec, old_path, new_path, "--json",
+                     "--timeout", "120"],
+                    capture_output=True, text=True, timeout=130,
+                )
+                try:
+                    yresult = json.loads(yproc.stdout.strip())
+                except json.JSONDecodeError:
+                    yresult = {
+                        "success": False,
+                        "reason": "yosys_cec_error",
+                        "output": (yproc.stdout or "") + "\n" + (yproc.stderr or ""),
+                        "elapsed": 0.0,
+                    }
+                result["crosscheck"] = {
+                    "yosys_success": yresult.get("success"),
+                    "yosys_reason": yresult.get("reason"),
+                }
+                if yresult.get("success"):
+                    return {
+                        "success": True,
+                        "reason": "equivalent",
+                        "output": (
+                            "ABC reported a counterexample, but Yosys equiv "
+                            "proved equivalence.\n\n"
+                            "ABC output:\n"
+                            + result.get("output", "")
+                            + "\n\nYosys output:\n"
+                            + yresult.get("output", "")
+                        ),
+                        "elapsed": (
+                            float(result.get("elapsed") or 0)
+                            + float(yresult.get("elapsed") or 0)
+                        ),
+                        "crosscheck": {
+                            "abc_reason": result.get("reason"),
+                            "yosys_reason": yresult.get("reason"),
+                        },
+                    }
+            return result
         except subprocess.TimeoutExpired:
             return {
                 "success": True,

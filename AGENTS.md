@@ -101,20 +101,21 @@ GateSpy 当前新增了一套 LLM 可驱动的网表逆向实验台。工具负�
 
 ### 已实现 MCP 工具
 
-- `infer_candidates(output="", methods=None, sample_num=256, detail=False)`：针对 PO word 生成初始候选，返回结构摘要、support words、样本拟合结果和 hypothesis id。当前内置线性与乘加模板，候选只作为 LLM 起点。
+- `infer_candidates(output="", methods=None, sample_num=256, detail=False)`：针对 PO word 生成初始候选，返回结构摘要、support words、样本拟合结果和 hypothesis id。当前内置模板包括线性加减、精确仿射大系数、常数/scale/shift、bit select/slice、稀疏双线性、多项式乘积和、乘加、比较器以及 MUX/条件表达式；候选只作为 LLM 起点。当 `output=""` 且输出数量较多时，工具会走 fast batch 模式，复用同一批样本并输出 `assignments_json`，可直接传给 `check_hypothesis` 做全输出验证。
 - `check_hypothesis(assignments, declarations="", sample_num=256, run_cec=True)`：接受 LLM 自己提出的 word-level hypothesis，例如 `{"out3": "in1 * (in2 + in3 + in4) + in5"}`。工具跑样本检查；若覆盖所有输出，还会生成临时 RTL、显式零扩展 word 操作数、计算 cost，并按需跑 CEC。
-- `fit_hypothesis(output, template, unknowns, sample_num=256)`：支持 LLM 自定义模板并求小整数系数。`unknowns` 可以是列表，也可以用 dict 指定搜索范围。
+- `fit_hypothesis(output, template, unknowns, sample_num=256)`：支持 LLM 自定义模板并求整数系数。小规模未知量使用网格搜索；当未知量组合数爆炸时，若模板对未知量是线性的，会自动切换到大规模 affine solver，可处理几十个系数，例如 `c0*x0 + c1*x1 + ...`。solver 会先用低幅值样本子集提出候选，再用全样本按输出位宽验证，以处理加法树输出回绕。
+- `fit_basis(output, basis, include_constant=True, coefficient_limit=4096, sample_num=256)`：开放式 basis 拟合接口。LLM 提供任意可求值 basis，例如 `["in1", "in2", "in1 * in2", "sel ? in5 : 0", "in8 << 3"]`；工具拟合 `const + Σ ci*basis_i`，并用样本严格验证。遇到新结构时优先扩展 basis，而不是修改内置模板；对大加法树可用分组 selector basis 避免人工枚举所有权重。
 - `trace_counterexample(hypothesis_id="", output="", bits=None, depth=3)`：回放最近失败 hypothesis 的 CEX 或样本 mismatch，返回 mismatch output、word-level 输入值、候选表达式中间项取值和相关 cone 摘要。
 
 ### 已实现模块
 
 `src/circuit/infer/` 按职责拆分为 `words`、`sampling`、`hypothesis`、`fitting` 和 `trace`。`CircuitSession` 保存最近候选、样本 mismatch、CEX 和 CEC 结果，但 `edit` 仍是唯一修改当前源码的工具。
 
-CEC 状态已分级：`proved` 表示严格证明等价，`counterexample` 表示有反例可追踪，`timeout_assumed` 只能作为候选证据，`error` 表示转换或验证失败。`edit` 已增加 `accept_timeout=False`，默认只接受 `proved`；LLM 若要接受 timeout 候选，必须显式设置。
+CEC 状态已分级：`proved` 表示严格证明等价，`counterexample` 表示有反例可追踪，`timeout_assumed` 只能作为候选证据，`error` 表示转换或验证失败。`check_hypothesis` 和 `edit` 的底层 CEC 默认先跑 ABC AIG flow；若 ABC 报 counterexample，会自动用 Yosys `equiv` 交叉验证，避免 word-level RTL 在 AIG 转换或 PO 映射上产生假反例。`edit` 已增加 `accept_timeout=False`，默认只接受 `proved`；LLM 若要接受 timeout 候选，必须显式设置。
 
 ### 计划工作流
 
-LLM 先用 `infer_candidates` 获取结构引导的初始候选。若候选不合适，直接用 `check_hypothesis` 验证自创公式；若公式有参数，用 `fit_hypothesis` 拟合；若 CEC 返回反例，用 `trace_counterexample` 定位冲突位、相关 cone 和中间项，再调整模板。最终由 LLM 组合多 PO 表达式和公共子表达式，调用 `edit(rewrite=...)` 应用 RTL，再用 `dump` 导出。
+LLM 先用 `infer_candidates` 获取结构引导的初始候选。若候选不合适，先根据 cone、仿真和反例构造 basis，用 `fit_basis` 拟合开放式表达式；若已知具体模板再用 `fit_hypothesis` 求参数；若已有完整公式则用 `check_hypothesis` 验证。CEC 返回反例时，用 `trace_counterexample` 定位冲突位、相关 cone 和中间项，再调整 basis 或公式。最终由 LLM 组合多 PO 表达式和公共子表达式，调用 `edit(rewrite=...)` 应用 RTL，再用 `dump` 导出。
 
 ### 依赖与安装
 
@@ -122,4 +123,4 @@ LLM 先用 `infer_candidates` 获取结构引导的初始候选。若候选不�
 
 ### 测试与后续增强
 
-新增测试覆盖候选推断、正确/错误 hypothesis 的样本状态、自定义模板拟合，以及样本 mismatch 到 trace 报告的转换。当前已验证 test01 的 CEC 路径和 test04 的样本路径：`out1 = in1 + in2`、`out2 = in3 - out1`、`out3 = in1 * (in2 + in3 + in4) + in5`。后续增强重点是接入 PySR 真实 symbolic regression、更多控制逻辑模板、跨 PO 公共子表达式优化，以及把 CEX 增量加入拟合集合。
+新增测试覆盖候选推断、正确/错误 hypothesis 的样本状态、自定义模板拟合、开放式 basis 拟合、样本 mismatch 到 trace 报告的转换，以及双线性、乘积和、比较器、MUX、shift、bit select、大系数仿射分支等内置模板。当前已验证 test01 的 CEC 路径、test04 的样本路径，以及 test19-style 的批量 MUX 阵列：7-bit 组使用 `base = in1 + in2 + 24 * in8`，6-bit 组使用 `base = in1 + in2 + 12 * in8`，`infer_candidates(output="")` 能输出 43/43 assignments，并由 `check_hypothesis` 证明等价。后续增强重点是把 CEX 增量加入 basis 拟合集合、跨 PO 公共子表达式优化，以及接入 PySR 真实 symbolic regression 作为 basis 生成器。

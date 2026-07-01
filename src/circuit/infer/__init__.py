@@ -7,7 +7,7 @@ from .hypothesis import (
     check_samples,
     render_hypothesis_rtl,
 )
-from .fitting import fit_builtin_candidates, fit_custom_template
+from .fitting import fit_basis_candidates, fit_builtin_candidates, fit_custom_template
 from .trace import trace_hypothesis_counterexample
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "check_samples",
     "render_hypothesis_rtl",
     "fit_builtin_candidates",
+    "fit_basis_candidates",
     "fit_custom_template",
     "trace_hypothesis_counterexample",
 ]

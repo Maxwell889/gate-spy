@@ -195,9 +195,10 @@ def infer_candidates(output: str = "",
 
     This is an LLM workbench tool, not an automatic rewrite.  It uses output
     cones to find support input words, runs deterministic/random samples, and
-    fits built-in linear or multiplication-addition templates.  Returned
-    candidates are stored as hypotheses and should be checked/refined with
-    ``check_hypothesis`` before using ``edit``.
+    fits built-in arithmetic, bit-selection, comparison, and MUX templates.  If
+    ``output`` is empty, it also emits a batch top-candidate assignment map that
+    can be passed directly to ``check_hypothesis``.  Returned candidates are
+    stored as hypotheses and should be checked/refined before using ``edit``.
     """
     return session.infer_candidates(
         output=output, methods=methods, sample_num=sample_num, detail=detail)
@@ -231,10 +232,35 @@ def fit_hypothesis(output: str,
 
     ``template`` should reference real input word names and unknown identifiers.
     ``unknowns`` may be a list (default domains) or a mapping such as
-    ``{"c": {"min": -512, "max": 512}, "a": [-1, 0, 1]}``.
+    ``{"c": {"min": -512, "max": 512}, "a": [-1, 0, 1]}``.  Small problems use
+    grid search; large affine templates such as ``c0*x0 + c1*x1 + ...`` are
+    solved directly instead of enumerating all coefficient combinations.
     """
     return session.fit_hypothesis(
         output=output, template=template, unknowns=unknowns,
+        sample_num=sample_num,
+    )
+
+
+@mcp.tool()
+def fit_basis(output: str,
+              basis: list[str],
+              include_constant: bool = True,
+              coefficient_limit: int = 4096,
+              sample_num: int = 256) -> str:
+    """Fit an LLM-supplied expression basis for one output word.
+
+    This is the open-ended alternative to adding more built-in templates.  The
+    model proposes basis terms such as ``["in1", "in2", "in1 * in2",
+    "sel ? in5 : 0", "in8 << 3"]``; GateSpy solves
+    ``const + sum(coeff_i * basis_i)`` and verifies the resulting expression on
+    samples.  Use ``check_hypothesis`` on the returned expression before edit.
+    """
+    return session.fit_basis(
+        output=output,
+        basis=basis,
+        include_constant=include_constant,
+        coefficient_limit=coefficient_limit,
         sample_num=sample_num,
     )
 
