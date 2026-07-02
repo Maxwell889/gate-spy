@@ -976,7 +976,7 @@ class CircuitSession:
             samples = simulate_samples(
                 c, input_words, {output: out_word}, sample_num=sample_num)
             sample_status, mismatches = check_samples(
-                {output: fit["expr"]}, "", samples, {output: out_word})
+                {output: fit["expr"]}, "", samples, {output: out_word}, input_words)
             rec = self._next_hypothesis(
                 {output: fit["expr"]},
                 note="run_method:polynomial_rewrite",
@@ -1194,7 +1194,7 @@ class CircuitSession:
             samples = shared_samples or simulate_samples(
                 c, input_words, output_words, sample_num=sample_num)
             sample_status, mismatches = check_samples(
-                batch_assignments, "", samples, output_words)
+                batch_assignments, "", samples, output_words, input_words)
             rec = self._next_hypothesis(
                 batch_assignments,
                 note="infer_candidates:batch_top",
@@ -1260,7 +1260,7 @@ class CircuitSession:
         samples = simulate_samples(
             c, input_words, output_words, sample_num=sample_num)
         sample_status, mismatches = check_samples(
-            assignments, declarations, samples, output_words)
+            assignments, declarations, samples, output_words, input_words)
 
         rec = self._next_hypothesis(assignments, declarations)
         rec.sample_status = sample_status
@@ -1283,7 +1283,7 @@ class CircuitSession:
                 assignments, declarations, input_words, output_words)
             if opt_stats.get("shared_count"):
                 opt_status, opt_mismatches = check_samples(
-                    opt_assignments, opt_declarations, samples, output_words)
+                    opt_assignments, opt_declarations, samples, output_words, input_words)
                 if opt_status == "pass":
                     rec.declarations = opt_declarations
                     rec.assignments = opt_assignments

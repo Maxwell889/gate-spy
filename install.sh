@@ -113,9 +113,15 @@ echo
 echo "[2/4] Setting up iccad22 skill..."
 SKILL_SRC="skills/iccad22.md"
 SKILL_DEST=".claude/skills/iccad22/SKILL.md"
+REF_SRC="skills/references"
+REF_DEST=".claude/skills/iccad22/references"
 
 if [[ ! -f "$SKILL_SRC" ]]; then
     echo "Error: Skill source file not found: $SKILL_SRC"
+    exit 1
+fi
+if [[ ! -d "$REF_SRC" ]]; then
+    echo "Error: Skill reference directory not found: $REF_SRC"
     exit 1
 fi
 
@@ -132,6 +138,19 @@ elif [[ -e "$SKILL_DEST" ]]; then
 else
     ln -sf "../../../$SKILL_SRC" "$SKILL_DEST"
     echo "  Created symlink: $SKILL_DEST -> $SKILL_SRC"
+fi
+
+if [[ -L "$REF_DEST" ]]; then
+    ln -sfn "../../../$REF_SRC" "$REF_DEST"
+    echo "  Reference symlink exists: $REF_DEST -> $REF_SRC"
+elif [[ -e "$REF_DEST" ]]; then
+    echo "  Warning: $REF_DEST exists but is not a symlink, backing up..."
+    mv "$REF_DEST" "${REF_DEST}.bak"
+    ln -sfn "../../../$REF_SRC" "$REF_DEST"
+    echo "  Created reference symlink: $REF_DEST -> $REF_SRC"
+else
+    ln -sfn "../../../$REF_SRC" "$REF_DEST"
+    echo "  Created reference symlink: $REF_DEST -> $REF_SRC"
 fi
 
 # 3. Download and extract ICCAD22 test cases
@@ -213,7 +232,8 @@ echo
 echo "=== ICCAD22 test environment setup complete! ==="
 echo
 echo "Summary:"
-echo "  ✓ iccad22 skill available at .claude/skills/iccad22.md"
+echo "  ✓ iccad22 skill available at .claude/skills/iccad22/SKILL.md"
+echo "  ✓ iccad22 references available at .claude/skills/iccad22/references/"
 echo "  ✓ ICCAD22 test cases available under examples/"
 echo "  ✓ .mcp.json configured for MCP server"
 echo

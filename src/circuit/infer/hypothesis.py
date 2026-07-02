@@ -13,7 +13,8 @@ from .words import Word
 _IDENT_RE = re.compile(r"\b[A-Za-z_]\w*\b")
 _SIZED_NUM_RE = re.compile(r"\b(\d+)'([bBoOdDhH])([0-9a-fA-F_xXzZ]+)\b")
 _DECL_RE = re.compile(
-    r"\b(?:wire|reg|logic)\s+(?:signed\s+)?(?:\[(\d+)\s*:\s*(\d+)\])?\s*(.+?)\s*;",
+    r"\b(?:wire|reg|logic)\s+(?:(signed|unsigned)\s+)?"
+    r"(?:\[(\d+)\s*:\s*(\d+)\]\s*)?(.+?)\s*;",
     re.DOTALL,
 )
 _ASSIGN_RE = re.compile(r"\bassign\s+(.+?)\s*=\s*(.+?)\s*;", re.DOTALL)
@@ -41,11 +42,77 @@ def _verilog_number_to_int(match: re.Match) -> str:
     return str(int(digits or "0", radix))
 
 
-def _to_python_expr(expr: str) -> str:
+def _to_signed_value(value: int, width: int | None) -> int:
+    if width is None or width <= 0:
+        return int(value)
+    mask = (1 << width) - 1
+    raw = int(value) & mask
+    sign = 1 << (width - 1)
+    return raw - (1 << width) if raw & sign else raw
+
+
+def _to_unsigned_value(value: int, width: int | None) -> int:
+    if width is None or width <= 0:
+        return int(value)
+    return int(value) & ((1 << width) - 1)
+
+
+def _infer_expr_width(expr: str, widths: dict[str, int] | None) -> int | None:
+    raw = _strip_outer_parens(expr)
+    m = _SIZED_NUM_RE.fullmatch(raw)
+    if m:
+        return int(m.group(1))
+    m = re.fullmatch(r"\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*:\s*(\d+)\s*\]", raw)
+    if m:
+        return abs(int(m.group(2)) - int(m.group(3))) + 1
+    m = re.fullmatch(r"\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]", raw)
+    if m:
+        return 1
+    m = re.fullmatch(r"\b([A-Za-z_]\w*)\b", raw)
+    if m and widths:
+        return widths.get(m.group(1))
+    return None
+
+
+def _convert_signed_casts(expr: str, widths: dict[str, int] | None) -> str:
+    """Translate Verilog signedness casts into width-aware Python calls."""
+    out: list[str] = []
+    pos = 0
+    call_re = re.compile(r"\$(signed|unsigned)\s*\(")
+    while True:
+        m = call_re.search(expr, pos)
+        if m is None:
+            out.append(expr[pos:])
+            break
+        out.append(expr[pos:m.start()])
+        depth = 1
+        arg_start = m.end()
+        idx = arg_start
+        while idx < len(expr) and depth:
+            if expr[idx] == "(":
+                depth += 1
+            elif expr[idx] == ")":
+                depth -= 1
+            idx += 1
+        if depth:
+            out.append(expr[m.start():])
+            break
+        inner = expr[arg_start:idx - 1]
+        converted_inner = _convert_signed_casts(inner, widths)
+        width = _infer_expr_width(inner, widths)
+        if width is None:
+            out.append(f"{m.group(1)}(({converted_inner}))")
+        else:
+            out.append(f"{m.group(1)}(({converted_inner}), {width})")
+        pos = idx
+    return "".join(out)
+
+
+def _to_python_expr(expr: str, widths: dict[str, int] | None = None) -> str:
+    expr = _convert_signed_casts(expr, widths)
     expr = _SIZED_NUM_RE.sub(_verilog_number_to_int, expr)
     expr = _convert_bit_selects(expr)
     expr = _convert_ternary(expr)
-    expr = re.sub(r"\$(signed|unsigned)\s*\(", "(", expr)
     expr = expr.replace("&&", " and ").replace("||", " or ")
     expr = re.sub(r"(?<![=!<>])!(?!=)", " not ", expr)
     return expr
@@ -134,20 +201,28 @@ _ALLOWED_NODES = {
     ast.UAdd, ast.USub, ast.Not, ast.And, ast.Or,
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
 }
+_ALLOWED_CALLS = {"bitsel", "signed", "unsigned"}
 
 
-def eval_expr(expr: str, env: dict[str, int]) -> int:
+def eval_expr(expr: str,
+              env: dict[str, int],
+              widths: dict[str, int] | None = None,
+              signed_names: set[str] | None = None) -> int:
     """Evaluate a side-effect-free arithmetic expression over word values."""
-    py_expr = _to_python_expr(expr)
+    py_expr = _to_python_expr(expr, widths)
     tree = ast.parse(py_expr, mode="eval")
     for node in ast.walk(tree):
         if type(node) not in _ALLOWED_NODES:
             raise ValueError(f"unsupported expression construct: {type(node).__name__}")
-        if isinstance(node, ast.Name) and node.id != "bitsel" and node.id not in env:
+        if (isinstance(node, ast.Name)
+                and node.id not in _ALLOWED_CALLS
+                and node.id not in env):
             raise KeyError(f"unknown identifier {node.id!r} in expression {expr!r}")
         if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id != "bitsel":
-                raise ValueError("only bitsel() calls are allowed in expressions")
+            if not isinstance(node.func, ast.Name) or node.func.id not in _ALLOWED_CALLS:
+                raise ValueError(
+                    "only bitsel(), signed(), and unsigned() calls are allowed in expressions"
+                )
 
     def bitsel(value: int, hi: int, lo: int) -> int:
         hi_i, lo_i = int(hi), int(lo)
@@ -155,24 +230,84 @@ def eval_expr(expr: str, env: dict[str, int]) -> int:
             hi_i, lo_i = lo_i, hi_i
         return (int(value) >> lo_i) & ((1 << (hi_i - lo_i + 1)) - 1)
 
-    safe_env = dict(env)
+    signed_names = signed_names or set()
+    safe_env = {
+        name: (
+            _to_signed_value(value, (widths or {}).get(name))
+            if name in signed_names else int(value)
+        )
+        for name, value in env.items()
+    }
     safe_env["bitsel"] = bitsel
+    safe_env["signed"] = lambda value, width=None: _to_signed_value(
+        int(value), int(width) if width is not None else None)
+    safe_env["unsigned"] = lambda value, width=None: _to_unsigned_value(
+        int(value), int(width) if width is not None else None)
     value = eval(compile(tree, "<hypothesis>", "eval"), {"__builtins__": {}}, safe_env)
     return int(value)
+
+
+def _split_decl_items(names: str) -> list[str]:
+    items: list[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(names):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(names[start:idx].strip())
+            start = idx + 1
+    tail = names[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def _parse_decl_item(item: str) -> tuple[str, str | None] | None:
+    lhs, sep, rhs = item.partition("=")
+    lhs = lhs.strip()
+    rhs = rhs.strip() if sep else None
+    m = re.match(r"^([A-Za-z_]\w*)\s*$", lhs)
+    if not m:
+        return None
+    return m.group(1), rhs
 
 
 def parse_local_widths(declarations: str) -> dict[str, int]:
     widths: dict[str, int] = {}
     for m in _DECL_RE.finditer(declarations or ""):
-        msb_s, lsb_s, names = m.groups()
+        _sign, msb_s, lsb_s, names = m.groups()
         width = abs(int(msb_s) - int(lsb_s)) + 1 if msb_s else 1
-        for name in re.findall(r"\b[A-Za-z_]\w*\b", names):
-            widths[name] = width
+        for item in _split_decl_items(names):
+            parsed = _parse_decl_item(item)
+            if parsed:
+                widths[parsed[0]] = width
     return widths
+
+
+def parse_local_signedness(declarations: str) -> set[str]:
+    signed: set[str] = set()
+    for m in _DECL_RE.finditer(declarations or ""):
+        sign, _msb_s, _lsb_s, names = m.groups()
+        if sign != "signed":
+            continue
+        for item in _split_decl_items(names):
+            parsed = _parse_decl_item(item)
+            if parsed:
+                signed.add(parsed[0])
+    return signed
 
 
 def parse_internal_assigns(declarations: str) -> list[tuple[str, str]]:
     assigns: list[tuple[str, str]] = []
+    for m in _DECL_RE.finditer(declarations or ""):
+        _sign, _msb_s, _lsb_s, names = m.groups()
+        for item in _split_decl_items(names):
+            parsed = _parse_decl_item(item)
+            if parsed and parsed[1] is not None:
+                assigns.append((parsed[0], parsed[1]))
     for m in _ASSIGN_RE.finditer(declarations or ""):
         lhs = m.group(1).strip()
         rhs = m.group(2).strip()
@@ -184,10 +319,18 @@ def parse_internal_assigns(declarations: str) -> list[tuple[str, str]]:
 def check_samples(assignments: dict[str, str],
                   declarations: str,
                   samples: list[Sample],
-                  output_words: dict[str, Word]) -> tuple[str, list[dict[str, Any]]]:
+                  output_words: dict[str, Word],
+                  input_words: dict[str, Word] | None = None
+                  ) -> tuple[str, list[dict[str, Any]]]:
     """Evaluate a hypothesis on samples and return ``(status, mismatches)``."""
     local_widths = parse_local_widths(declarations)
+    local_signed = parse_local_signedness(declarations)
     internal_assigns = parse_internal_assigns(declarations)
+    widths = {
+        **({name: word.width for name, word in (input_words or {}).items()}),
+        **{name: word.width for name, word in output_words.items()},
+        **local_widths,
+    }
     mismatches: list[dict[str, Any]] = []
 
     try:
@@ -197,14 +340,18 @@ def check_samples(assignments: dict[str, str],
             for lhs, rhs in internal_assigns:
                 width = local_widths.get(lhs)
                 mask = (1 << width) - 1 if width else None
-                value = eval_expr(rhs, env)
-                env[lhs] = value & mask if mask is not None else value
+                value = eval_expr(rhs, env, widths, local_signed)
+                if mask is not None:
+                    value &= mask
+                    if lhs in local_signed:
+                        value = _to_signed_value(value, width)
+                env[lhs] = value
 
             for out_name, expr in assignments.items():
                 if out_name not in output_words:
                     raise KeyError(f"{out_name!r} is not an output word")
                 word = output_words[out_name]
-                got = eval_expr(expr, env) & word.mask
+                got = eval_expr(expr, env, widths, local_signed) & word.mask
                 env[out_name] = got
                 expected = sample.outputs[out_name] & word.mask
                 if got != expected:

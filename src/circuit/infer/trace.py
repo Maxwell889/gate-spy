@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any, TYPE_CHECKING
 
-from .hypothesis import HypothesisRecord, eval_expr, parse_internal_assigns, parse_local_widths
+from .hypothesis import (
+    HypothesisRecord,
+    eval_expr,
+    parse_internal_assigns,
+    parse_local_signedness,
+    parse_local_widths,
+)
 from .words import Word, expand_word_value, word_value
 
 if TYPE_CHECKING:
@@ -81,7 +87,13 @@ def trace_hypothesis_counterexample(circuit: "Circuit",
     }
 
     local_widths = parse_local_widths(record.declarations)
+    local_signed = parse_local_signedness(record.declarations)
     internal_assigns = parse_internal_assigns(record.declarations)
+    widths = {
+        **{name: word.width for name, word in input_words.items()},
+        **{name: word.width for name, word in output_words.items()},
+        **local_widths,
+    }
     env: dict[str, int] = dict(inputs)
     subterm_values: dict[str, list[tuple[str, int | str]]] = {}
     candidate_outputs: dict[str, int] = {}
@@ -89,18 +101,23 @@ def trace_hypothesis_counterexample(circuit: "Circuit",
     try:
         for lhs, rhs in internal_assigns:
             width = local_widths.get(lhs)
-            val = eval_expr(rhs, env)
-            env[lhs] = val & ((1 << width) - 1) if width else val
+            val = eval_expr(rhs, env, widths, local_signed)
+            if width:
+                val &= (1 << width) - 1
+                if lhs in local_signed:
+                    sign = 1 << (width - 1)
+                    val = val - (1 << width) if val & sign else val
+            env[lhs] = val
         for out_name, expr in record.assignments.items():
             vals: list[tuple[str, int | str]] = []
             for term in _extract_subterms(expr):
                 try:
-                    vals.append((term, eval_expr(term, env)))
+                    vals.append((term, eval_expr(term, env, widths, local_signed)))
                 except Exception as exc:
                     vals.append((term, f"error: {exc}"))
             subterm_values[out_name] = vals
             if out_name in output_words:
-                val = eval_expr(expr, env) & output_words[out_name].mask
+                val = eval_expr(expr, env, widths, local_signed) & output_words[out_name].mask
                 env[out_name] = val
                 candidate_outputs[out_name] = val
     except Exception as exc:

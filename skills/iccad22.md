@@ -1,65 +1,138 @@
-# ICCAD 2022 Problem A — Gate-Level to Word-Level Recovery
+---
+name: iccad22-rtl-recovery
+description: Uses GateSpy to recover low-cost word-level RTL from ICCAD22 Problem A style primitive-gate Verilog. Use when the task mentions gate-level netlists, top_primitive.v, top_recovered.v, CEC, contest cost, or reverse engineering arithmetic/comparator/MUX circuits.
+---
 
-You are recovering word-level RTL from a flattened primitive-gate Verilog netlist. The goal is not just to make the circuit readable; the final RTL must be CEC-equivalent and must minimize the ICCAD22 contest cost.
+# GateSpy Skill: Gate-Level to Word-Level Recovery
 
-## Agent Role
+Recover word-level RTL from flattened primitive-gate Verilog. The final source
+must be equivalent to the loaded design and low under the ICCAD22 cost model.
 
-GateSpy is a hypothesis workbench, not a complete solver. Use tools to inspect structure, generate samples, fit expressions, check hypotheses, trace counterexamples, and measure cost. You remain responsible for strategy:
+GateSpy is a hypothesis workbench. Tools inspect structure, sample behavior,
+fit expressions, check hypotheses, trace failures, apply edits, and measure
+cost. The LLM is responsible for grouping outputs, choosing methods, inventing
+templates, recording evidence, and auditing cost.
 
-- invent new word-level hypotheses when built-in templates do not fit;
-- decide when to group outputs, share intermediate wires, or rewrite expressions by hand;
-- write small local analysis scripts when the MCP tools are too rigid;
-- never treat random simulation, template fitting, or timeout as proof.
+## Core Invariants
 
-Only a strict CEC `proved` result is final proof. `counterexample`, `timeout_assumed`, and `error` are evidence to investigate.
+1. Do not proceed without a concrete Verilog path.
+2. Random simulation is evidence, not proof.
+3. Only CEC `proved` is final proof. `counterexample`, `timeout_assumed`, and
+   `error` are investigation states. If the user explicitly accepts timeout,
+   label the result as timeout-assumed, not proved.
+4. Always audit width, truncation, constants, and signedness for arithmetic,
+   comparator, shift, and slice logic.
+5. Recover output groups when outputs share support, structure, select signals,
+   arithmetic trees, or CEX behavior. Recover scalar outputs only when isolated.
+6. A proved RTL is not final until plausible lower-cost rewrites have been
+   tried and rejected.
+7. Never treat `run_method`, `infer_candidates`, `fit_*`, `simulate`, or
+   `scripts/cost.py` as source modification or equivalence proof.
 
-## Prerequisites
+## Reference Files
 
-If the user did not provide a Verilog file path, ask for it first. Do not proceed without one.
+Use these direct references when the task needs the detail:
 
-Use the repository setup first:
+- `references/iccad22-tools.md`: available GateSpy tools, arguments, returns,
+  and state changes.
+- `references/iccad22-scoring.md`: full contest operator/keyword cost model.
+- `references/iccad22-patterns.md`: signedness, output grouping, CEX
+  refinement, fallback scripting, and cost-audit patterns.
 
-```bash
+## Required Workflow
+
+Keep this checklist live during recovery:
+
+```text
+- [ ] Verilog path confirmed
+- [ ] Design loaded and port/gate summary recorded
+- [ ] Outputs grouped before formula recovery
+- [ ] Evidence record maintained for each output group
+- [ ] Strategy lane chosen with reason
+- [ ] Hypothesis sample-checked
+- [ ] Width/signedness/boundary audit done
+- [ ] CEX traced or CEC proved
+- [ ] Cost audit decision recorded for each final output group
+- [ ] Accepted RTL dumped, or unresolved state reported
+```
+
+## Phase 0 - Setup
+
+For a fresh repository session, run setup before using GateSpy tools unless the
+user explicitly says setup is already complete:
+
+```text
 bash install.sh
 ```
 
-The script installs Python dependencies, checks Julia/PySR and Yosys tooling, creates the Claude skill symlink, and prepares MCP configuration.
+For ordinary code development, `uv sync --dev` is enough.
 
-## Phase 1 — Load And Inspect
+## Phase 1 - Load And Inspect
 
-1. Load the primitive netlist:
+If no concrete Verilog path is provided, search the current repository for a
+unique `top_primitive.v`. If exactly one candidate exists, use it and record
+the path. If none or multiple candidates exist, ask the user to choose. Do not
+recover from screenshots, guessed filenames, or unconfirmed files.
 
-   ```text
-   read_file("<path/to/top_primitive.v>")
-   ```
+```text
+read_file("<path/to/top_primitive.v>")
+print_adder_stats(detail=True)
+print_xor_stats(detail=True)
+simulate(pattern_num=16, seed=1)
+```
 
-2. Inspect words and local structure:
+After `read_file`, first identify top module name, input/output ports and
+widths, output naming pattern, gate count, and whether outputs are scalar bits
+or packed words. Then use `get_node` and `find_cone` on representative
+input/output ports; do not assume an output is named `out1`.
 
-   ```text
-   get_node("out1")
-   find_cone(["out1"], direction="backward", depth=3)
-   print_adder_stats(detail=True)
-   print_xor_stats(detail=True)
-   simulate(pattern_num=16, seed=1)
-   ```
+Record adder/CSA/CPA trees, XOR chains, MUX arrays, comparators, bit slices,
+repeated cones, and unused inputs.
 
-Use these calls to identify support words, output grouping, adder/CSA trees, XOR chains, MUX arrays, comparators, bit slices, and repeated cones.
+## Phase 2 - Group Outputs And Keep Evidence
 
-## Phase 2 — Choose A Recovery Lane
+Before recovering formulas, group outputs by shared support, adjacent bit index,
+similar cone structure, common arithmetic tree, common select/control signals,
+or common CEX behavior.
 
-Before trying formulas, ask GateSpy to rank the available methods:
+For each output group, maintain:
+
+```text
+- output group:
+- bit range:
+- support words:
+- structural evidence:
+- suspected operator family:
+- signedness status:
+- current best hypothesis:
+- sample result:
+- CEC result:
+- known counterexamples:
+- current cost:
+- cheaper alternatives tried:
+- final status:
+```
+
+Every failed hypothesis must record the smallest known contradiction: mismatch
+bit, input valuation, and suspected cause. Classify failures as pairing,
+signedness, width/truncation, selector, constant, missing term, or missing
+shared intermediate before changing direction.
+
+## Phase 3 - Select A Strategy Lane
+
+Use strategy ranking as a hint, not an authority:
 
 ```text
 propose_strategy(output="out3", detail=True)
 ```
 
-The three lanes are tried from cheap to expensive:
+Available lanes:
 
-1. `template`: structure-guided built-in templates plus LLM-defined basis/template fitting.
-2. `polynomial`: bounded PO-to-PI structural rewrite. This can expose exact logic, but may explode; trust its budget estimate.
-3. `symbolic`: sample-driven symbolic regression. Use it after template/polynomial miss, then refine with CEX.
+- `template`: built-in templates plus LLM-defined basis/template fitting.
+- `polynomial`: bounded PO-to-PI structural rewrite; useful but can explode.
+- `symbolic`: sample-driven symbolic regression and compact word sketches.
 
-You can run one lane explicitly:
+Run a lane only after the evidence record says why:
 
 ```text
 run_method(output="out3", method="template", sample_num=256)
@@ -67,40 +140,29 @@ run_method(output="out3", method="polynomial", budget={"max_expr_chars": 24000})
 run_method(output="out3", method="symbolic", budget={"max_expr_size": 6})
 ```
 
-These calls create hypotheses but do not edit source code. Treat their output as evidence for the next hypothesis.
+If `polynomial` is over budget, narrow the cone/output group or force it only
+with a concrete reason. If `symbolic` exceeds budget, construct smaller basis
+terms, split the cone, or write a targeted temporary script; do not fall back to
+blind guessing.
 
-Do not blindly launch expensive lanes on a large output. `polynomial` skips by default when the PO-to-PI rewrite estimate exceeds budget; only use `budget={"force": true, ...}` after you have a reason. `symbolic` does not immediately ask the LLM to guess: it first runs affine prefit, then a compact word-sketch search generated from the support words, including shifted affine forms, product-add-shift forms such as `(a * b + c) >> k`, and small product-of-sums forms. Only after these bounded WolFEx-style sketches fail does it try broader grammar search or return `budget_exceeded`. In that case, cut the cone or design smaller basis terms manually.
+## Phase 4 - Generate Hypotheses
 
-## Phase 3 — Generate Candidate Hypotheses
-
-Start with the automatic candidate generator:
+Start with automatic candidates:
 
 ```text
 infer_candidates(output="", sample_num=256, detail=True)
 ```
 
-For many-output cases, `output=""` can return batch `assignments_json`. Feed that directly into:
+For many-output cases, pass emitted `assignments_json` directly to
+`check_hypothesis` for whole-module validation. `none fitted` means the built-in
+search was too narrow, not that the circuit is unrecoverable.
 
-```text
-check_hypothesis(assignments=<assignments_json>, sample_num=512, run_cec=True)
-```
-
-Built-in candidates are only starting points. A `none fitted` result means the search space was too narrow, not that the circuit is unrecoverable. Move to `fit_basis`, polynomial rewrite, symbolic regression, or a temporary script.
-
-## Phase 4 — Fit LLM-Defined Structure
-
-When the built-in templates miss, create your own basis or template from structure and samples.
-
-Use `fit_basis` when you can propose useful terms but do not know coefficients:
+Use `fit_basis` when useful terms are known but coefficients are not:
 
 ```text
 fit_basis(
   output="out1",
-  basis=[
-    "in3 ? (in1 + in2 + in19 + in20) : (in5 + in6 + in21 + in22)",
-    "in7", "in8", "in9", "in10",
-    "in23", "in24", "in25"
-  ],
+  basis=["in1", "in2", "in1 * in2", "sel ? in5 : 0", "in8 << 3"],
   sample_num=512
 )
 ```
@@ -115,7 +177,7 @@ fit_hypothesis(
 )
 ```
 
-Use `check_hypothesis` when you already have an expression:
+Use `check_hypothesis` for LLM-proposed assignments:
 
 ```text
 check_hypothesis({
@@ -123,106 +185,119 @@ check_hypothesis({
 }, run_cec=True)
 ```
 
-If CEC or samples fail, call:
+`check_hypothesis` does not modify source. It sample-checks assignments,
+computes cost, can share repeated common expressions, and can run CEC for
+whole-module hypotheses. Use whole-module assignments when possible. Partial
+assignments are useful for debugging samples, but final proof must cover all
+outputs. Passing samples is only permission to try CEC or edit; it is not
+strong enough to finalize a formula. The sample checker supports
+`$signed(...)`, `$unsigned(...)`, and simple `wire signed [...] name = expr;`
+local declarations, but complex Verilog signed propagation still requires
+explicit width/signedness audit.
+
+## Phase 5 - Boundary, Width, And Signedness Audit
+
+Before accepting or rejecting arithmetic/comparator logic, test targeted
+patterns: zero, one-hot, all-ones, max positive, sign bit only, values around
+the sign bit, one active product/comparator operand at a time, selector values
+for each MUX arm, and output overflow/truncation boundaries.
+
+Signedness is an interpretation property, not necessarily visible in the gate
+structure. Prefer explicit signed intermediates:
+
+```verilog
+wire signed [7:0] sa = a;
+wire signed [7:0] sb = b;
+assign out = sa * sb;
+```
+
+For low-bit outputs, make truncation explicit:
+
+```verilog
+wire signed [15:0] prod = sa * sb;
+assign out = prod[15:0];
+```
+
+## Phase 6 - Refine With Counterexamples
+
+When samples or CEC fail, do not restart blindly:
 
 ```text
 explain_failure(output="out3", depth=4)
 trace_counterexample(output="out3", depth=4)
 ```
 
-Then compare mismatch bits, word-level input values, candidate subterms, and the fan-in cone. Adjust the hypothesis around the contradiction instead of restarting blindly.
+Update the evidence record with mismatch bit/word, exact input valuation,
+old/new values, candidate subterm values, related cone evidence, and suspected
+cause. Use the contradiction to add a basis term, alter a selector, change
+signedness/truncation, split an output group, or switch lane.
 
-## Phase 5 — Mandatory Cost Reduction Pass
+## Phase 7 - Apply Edit And Prove
 
-Correctness is not enough. After a hypothesis passes samples or CEC, do not dump immediately. Run a cost-reduction pass and ask whether the same function can be written with fewer contest operators. Only finalize after this pass has been attempted.
-
-Use `check_hypothesis(..., share_common=True)` unless there is a reason not to. It extracts conservative repeated additive subexpressions into `gs_cse*` wires and reruns sample checks before CEC.
-
-Still inspect the result manually. Common cost mistakes:
-
-- duplicated bases such as `x + y + k * z` repeated across many outputs;
-- explicit zero-extension or concat that does not change semantics but increases cost;
-- expanded MUX arms that can share a base wire;
-- recomputing an output expression instead of reusing the output or an intermediate wire;
-- using `case` when nested `?:` is cheaper.
-- performing the expensive operator inside every branch instead of selecting operands first.
-
-Use this reasoning loop:
-
-1. Count expensive operators in the proven expression (`*`, large condition trees, shifts, compares, bit-selects).
-2. Ask whether the same expensive operator is repeated across branches or outputs.
-3. If so, try moving selectors to operands instead of results, or extracting a shared intermediate.
-4. Estimate cost before and after using the contest rules.
-5. Validate the cheaper form with `check_hypothesis` before accepting it.
-
-Common abstract rewrites to consider:
-
-- `sel ? a * b : a * c` → `a * (sel ? b : c)`
-- `sel ? a + b : a + c` → `a + (sel ? b : c)`
-- multi-branch choices among related products → choose the operands first, then apply one product;
-- repeated branch suffix/prefix terms → extract a shared wire;
-- repeated shifted/scaled bases → compute the base once and share it.
-
-If the simplification is not obvious, write a temporary script to enumerate algebraic variants, measure them with `scripts/cost.py`, and sample-check the best few with `check_hypothesis(run_cec=false)`. Keep this script in `/tmp` unless it becomes a reusable project tool.
-
-If the tool expands an expression and raises cost, simplify it yourself or write a temporary optimizer script, then re-run `check_hypothesis`. If a lower-cost variant passes samples, rerun CEC or `edit` on that variant before dumping.
-
-## Fallback Scripting Rules
-
-You may write local scripts during recovery when the existing MCP tools are insufficient. Use this for tasks like grouping outputs, mining repeated support sets, enumerating candidate basis terms, simplifying generated assignments, or comparing many sample traces.
-
-Rules:
-
-- Put one-off scripts in `/tmp` or a clearly named temporary path.
-- Make scripts deterministic: fixed input paths, fixed seeds, concise printed output.
-- Do not overwrite source or recovered RTL from an exploratory script.
-- Keep script outputs small enough to inspect.
-- If a script becomes generally useful, propose moving it into `scripts/` with tests.
-- Delete or ignore scratch scripts after use; do not leave unmanaged project clutter.
-- A script result is never proof. Validate the final formula with `check_hypothesis` or `edit` CEC.
-
-## Phase 6 — Apply, Revert, And Dump
-
-Use `edit` only when a rewrite is ready to modify the current source:
+Before `edit`, ensure the RTL is complete for the module. Prefer
+complete-module `rewrite` for final transformations. Use `matches` and
+`replacements` only for small local cleanups where the match string is unique
+and unchanged outputs are explicitly preserved. For multi-output modules, do
+not edit one output unless the tool explicitly preserves all other outputs. If
+outputs share intermediate wires, validate them together.
 
 ```text
 edit(rewrite="<complete RTL>")
 ```
 
-The backend runs CEC. Rejected edits are not applied. If a path gets worse:
+Rejected edits are not applied. Timeout is rejected unless
+`accept_timeout=True`; if timeout is accepted by explicit user instruction,
+record final status as timeout-assumed, not proved. Use `revert(help=True)` and
+`revert(depth=1)` if a path becomes worse.
 
-```text
-revert(help=True)
-revert(depth=1)
-```
+## Phase 8 - Cost Reduction Audit
 
-Review final code before dumping:
+Correctness is not enough. Phase 8 is a local optimization loop over the
+current proved or accepted RTL, not a restart of recovery. Keep the current
+accepted RTL as the safety baseline: if a cheaper candidate fails samples or
+CEC, reject/revert that candidate and continue from the baseline; if it proves,
+make it the new baseline and audit again. Before `dump`, perform three passes:
+
+1. Re-read recovered RTL as source. Look for repeated terms, removable
+   extensions, avoidable slices/concats, cheaper operators, or factoring.
+2. Re-check outputs together. Look for common bases, sibling outputs differing
+   by constants/selectors, and shared intermediate wires.
+3. Compare plausible cheaper rewrites with `scripts/cost.py`, then validate the
+   cheaper form with `check_hypothesis` or `edit`.
+
+For each final output group, record at least one cost-audit decision: either a
+cheaper rewrite that was tried and failed, or a reason no cheaper rewrite is
+plausible.
+
+Use the full contest operator set. For example, `in1 ** 3` can be cheaper than
+`in1 * in1 * in1`; shifts, reductions, compares, `%`, `case`, and `?:` may also
+win. Do not finalize with only "equivalent"; state that no obvious lower-cost
+equivalent form remains.
+
+## Phase 9 - Dump Or Report Unsolved
+
+Review current source:
 
 ```text
 show(detail=True)
+```
+
+Dump only accepted recovered RTL:
+
+```text
 dump("<path/to/top_recovered.v>")
 ```
 
-## Scoring Reference
+If unresolved, report the evidence ledger: current best hypothesis, exact
+failure, known CEX, methods tried, and next bounded experiment.
 
-Reduction rate must be at least 70% to score:
+## Fallback Scripting
 
-```text
-reduction_rate = (1 - cost / gate_count) * 100%
-```
+Use local scripts when MCP tools are too rigid for grouping outputs, mining
+support sets, enumerating basis terms, simplifying assignments, or comparing
+many traces.
 
-Operator costs are intentionally simple: `+`, `-`, `*`, shift, compare, `?:`, bit/part select, concat, reduction, and most logical operators cost 1 per operator use or bit as defined by the contest script. Declarations such as `wire`, `assign`, `input`, and `output` cost 0.
-
-Use `scripts/cost.py` or the cost shown by GateSpy tools to compare alternatives.
-
-## Practical Hints
-
-- Prefer word-level semantics: one `+` or `*` can replace hundreds of gates.
-- For large linear sums, use `fit_basis` or the large affine path in `fit_hypothesis`; do not manually guess dozens of weights.
-- For MUX arrays, identify the select signal and shared true/false bases separately.
-- For bit slices, be explicit about output width, truncation, and unsigned versus signed interpretation.
-- Prefer declaring signed intermediate wires over `$signed(...)` when signed comparison is required.
-- Use CEX as a debugging target: the wrong bit and input valuation usually point to the missing term, wrong selector, or width error.
-- Do not stop at the first CEC-proved formula if the cost is obviously bloated; simplify and prove again.
-- If `polynomial` reports budget overflow, do not force it globally; cut the cone, run it on fewer bits, or switch to LLM-designed basis terms.
-- If `symbolic` returns nearest sample matches, use them to identify missing operators, then verify the revised formula with `check_hypothesis`.
+Rules: put one-off scripts in `/tmp` or a clearly named temporary path; use
+fixed input paths and seeds; keep output small; do not overwrite source or
+recovered RTL; do not treat script results as proof. If a script becomes
+generally useful, propose moving it into `scripts/` with tests.

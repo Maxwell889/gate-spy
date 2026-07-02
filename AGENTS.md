@@ -31,7 +31,7 @@ uv sync --dev
 bash install.sh
 ```
 
-这个脚本会安装 Python 依赖，检查并在 macOS/Homebrew 环境下自动安装缺失的 `uv`、Julia、Yosys，创建 `.claude/skills/iccad22/SKILL.md`，尝试从 Google Drive 下载 ICCAD22 测例，并生成 `.mcp.json`。如果下载失败，可以手动把测例放到 `examples/testcase/`；如果只做本库代码开发或运行现有单元测试，通常先执行 `uv sync --dev` 即可。
+这个脚本会安装 Python 依赖，检查并在 macOS/Homebrew 环境下自动安装缺失的 `uv`、Julia、Yosys，创建 `.claude/skills/iccad22/SKILL.md` 和 `.claude/skills/iccad22/references`，尝试从 Google Drive 下载 ICCAD22 测例，并生成 `.mcp.json`。如果下载失败，可以手动把测例放到 `examples/testcase/`；如果只做本库代码开发或运行现有单元测试，通常先执行 `uv sync --dev` 即可。
 
 运行测试：
 
@@ -83,21 +83,28 @@ scripts/v2aig.sh examples/Mul_F16.v /tmp/mul.aig
 
 ## 当前 ICCAD22 Skill 的逆向流程
 
-当前 `.claude/skills/iccad22/SKILL.md` 是指向 `skills/iccad22.md` 的 symlink。更新 MCP 工具、逆向流程或 contest cost 策略时，必须同步维护 `skills/iccad22.md`，否则 Claude 打开仓库后仍会按旧流程工作。
+当前 `.claude/skills/iccad22/SKILL.md` 是指向 `skills/iccad22.md` 的 symlink，`.claude/skills/iccad22/references` 是指向 `skills/references` 的 symlink。更新 MCP 工具、逆向流程或 contest cost 策略时，必须同步维护 `skills/iccad22.md` 和 `skills/references/`，并确保 `install.sh` 会创建这两个链接，否则 Claude 打开仓库后可能只能看到主 skill，看不到 reference 文件。
 
 该 Skill 定义的是 agent 驱动的迭代式恢复流程：GateSpy 负责结构观察、采样、拟合、验证、反例追踪和 cost 评估；LLM 负责提出假设、发明新模板、合并公共表达式，并在工具不够用时写受控的临时分析脚本。
 
-流程分五步：
+`skills/iccad22.md` 按 Claude skill best practices 改成“短入口 + 直接引用文件”的结构。主文件必须有 YAML frontmatter（`name`、`description`），保持恢复流程、硬性规则和 checklist；长表格和细节放到 `skills/references/`，避免主 skill 过长导致模型抓不住重点。
 
-1. **加载与理解电路**：`read_file(path)` 解析 gate-level Verilog，建立 circuit IR，并保存当前源码。随后用 `get_node` 查看端口/内部信号，用 `find_cone` 追踪输出的 fan-in/fan-out 边界，用 `print_adder_stats` 和 `print_xor_stats` 定位加法树、CSA/CPA 结构和 XOR 链，再用 `simulate` 对少量输入模式做行为观察。
+当前必须同步维护四类内容：
 
-2. **选择逆向通道**：先用 `propose_strategy` 对每个 PO word 排序三条通道：`template`、`polynomial`、`symbolic`。LLM 根据 cone 规模、support、重汇聚和已有经验决定先跑哪条通道；通常先便宜的 template，再 bounded polynomial rewrite，最后 symbolic regression。
+1. **Core Invariants**：没有 Verilog 路径不开始；随机仿真不是证明；只有 CEC `proved` 是最终证明；算术/比较/移位/切片必须审计 width、truncation、constant sizing 和 signedness；共享 support 或结构的输出优先按 group 恢复；proved RTL 还要经过 cost audit 后才能 dump。
+2. **Tool Semantics**：在 `skills/references/iccad22-tools.md` 明确每个 MCP 工具的用途、典型调用、返回结果和状态变更。`read_file` 加载设计；`run_method`、`infer_candidates`、`fit_basis`、`fit_hypothesis` 只产生候选；`check_hypothesis` 只验证临时 hypothesis；`edit` 是唯一修改当前 recovered source 的工具；`dump` 只写出已接受源码；`scripts/cost.py` 只算 contest cost，不证明等价。
+3. **Evidence Ledger**：每个 output 或 output group 都要记录 bit range、support words、结构证据、疑似算子族、signedness、当前最佳假设、sample/CEC 结果、已知 counterexample、当前 cost、尝试过的更低 cost 改写和最终状态。失败 hypothesis 必须记录最小矛盾：mismatch bit、输入取值和疑似原因。
+4. **Scoring Reference**：在 `skills/references/iccad22-scoring.md` 维护完整 contest operator/keyword cost；疑难恢复经验放在 `skills/references/iccad22-patterns.md`。
 
-3. **生成与拟合候选**：用 `run_method(output, method="template|polynomial|symbolic")` 显式运行某条通道。若 template 没有结果，改用 `fit_basis` 或 `fit_hypothesis` 让 LLM 自定义 basis/template；polynomial 通道会受预算限制，symbolic 通道会按样本做受限表达式搜索。已有完整公式时用 `check_hypothesis` 做样本检查和 CEC；失败时用 `explain_failure` 或 `trace_counterexample` 定位冲突位、输入取值和相关 cone。
+执行纪律：fresh repository session 默认先跑 `bash install.sh`，除非用户明确说已完成环境准备；用户没给 Verilog 路径时，只能在仓库内搜索唯一 `top_primitive.v`，多于一个或没有就让用户选择；`read_file` 后先记录 top module、port widths、output naming pattern、gate count 和输出是否 packed word，不能默认存在 `out1`；partial `check_hypothesis` 只能做样本调试，最终证明必须覆盖所有输出；final `edit` 优先完整 `rewrite`，`matches/replacements` 只用于唯一匹配的小清理；cost audit 是基于当前 proved/accepted RTL 的局部优化闭环，便宜候选失败就保留原 baseline，通过才更新 baseline；每个最终 output group 必须记录一次 cost-audit decision，即尝试过的低 cost 替代或无更便宜形式的理由。
 
-4. **强制 cost 降低复查**：`check_hypothesis(..., share_common=True)` 默认做保守共享，但 LLM 仍要人工检查是否存在无谓零扩展、重复 base、可合并 MUX arm、重复输出表达式等明显高 cost 写法。CEC 或样本通过后不能立即 dump，必须尝试一次 factoring/CSE/operand-selection pass。思路是先数 expensive operators，再判断这些运算是否在分支或多输出中重复；如果重复，尝试先选择 operand、提取共享 wire 或移动公共项，再用 `scripts/cost.py` 和 `check_hypothesis(run_cec=false)` 比较候选。
+当前流程分为：Repository Setup；Load/Port/Structure Inspection；Output Grouping and Evidence Ledger；Strategy Selection；Hypothesis Generation；Boundary/Width/Signedness Audit；Counterexample-Guided Refinement；Apply Edit and Prove；Cost Reduction Audit；Dump or Report Unsolved。
 
-5. **应用与导出**：确认候选既等价又低 cost 后，用 `edit(rewrite=...)` 修改当前源码；若 CEC 失败或 cost 变差，用 `revert` 回退。最终用 `show(detail=true)` 复查，再用 `dump(output_path)` 写出 `*_recovered.v`。
+关键工具顺序是：先 `read_file`、`get_node`、`find_cone`、`print_adder_stats`、`print_xor_stats`、`simulate` 建立结构证据；再用 `propose_strategy` 排序 `template`、`polynomial`、`symbolic` 三条 lane，但把它当 hint 而不是裁决；候选生成用 `run_method`、`infer_candidates`、`fit_basis`、`fit_hypothesis`；完整公式用 `check_hypothesis`；失败后用 `explain_failure` 或 `trace_counterexample` 追 mismatch；最终 only after proof and cost audit 才用 `edit`、`show`、`dump`。
+
+多输出模块不能只改一个输出，除非工具明确保留其余输出。共享中间 wire 的输出必须一起验证；单独正确的公式可能全局 cost 更差。LLM 可以写 `/tmp` 临时脚本分析原始 netlist、当前 recovered RTL、样本或 CEX trace，但脚本不能静默重建或修改被测设计，脚本结论也不能替代 CEC。
+
+Skill 的 Scoring Reference 必须列出完整 contest operator/keyword cost。最终审计以 `scripts/cost.py` 为准，不以常规 RTL 可读性为准；允许使用 `**`、`%`、shift、reduction、compare、`case` 等所有 contest 允许且 CEC 可验证的写法。新增 skill 内容时优先放入主流程；只有工具表、评分表或可选疑难模式才放进 reference 文件。
 
 LLM 可以在还原过程中写一次性脚本补足 MCP 工具短板，例如批量统计 support、挖掘重复表达式、枚举 basis、整理 `assignments_json` 或比较样本 trace。脚本应放在 `/tmp` 或明确的临时路径，固定 seed 和输入路径，输出保持简短，不直接覆盖源码或 recovered RTL；如果脚本具有复用价值，再讨论是否加入 `scripts/` 并补测试。脚本结论不能替代证明，最终仍必须通过 `check_hypothesis` 或 `edit` 的 CEC。
 
@@ -111,7 +118,7 @@ GateSpy 当前新增了一套 LLM 可驱动的网表逆向实验台。工具负�
 - `run_method(output, method, sample_num=256, budget=None, detail=False)`：显式运行某条通道但不修改源码。`method="template"` 等价于按目标输出运行 `infer_candidates`；`method="polynomial"` 先检查预算再展开 bit-level 结构表达式并样本验证，估算超限时默认 `skipped_budget`，只有显式 `budget={"force": true}` 才强跑；`method="symbolic"` 不直接把问题交回给 LLM 猜，而是依次运行 affine prefit、由 support words 系统生成的 compact word sketches（shifted affine、product-add-shift、小 product-of-sums 等）、word-level grammar search，最后才进入 bit-select grammar。若这些 WolFEx-style 轻量搜索都失败且 support bits 太宽，会返回 `budget_exceeded` 而不是进入大枚举。
 - `explain_failure(hypothesis_id="", output="", depth=3)`：包装最近失败 hypothesis 的状态、诊断建议和 `trace_counterexample` 输出，帮助 LLM 判断是补 basis、改 selector、处理位宽，还是切换方法。
 - `infer_candidates(output="", methods=None, sample_num=256, detail=False)`：针对 PO word 生成初始候选，返回结构摘要、support words、样本拟合结果和 hypothesis id。当前内置模板包括线性加减、精确仿射大系数、常数/scale/shift、bit select/slice、稀疏双线性、多项式乘积和、乘加、比较器以及 MUX/条件表达式；候选只作为 LLM 起点。当 `output=""` 且输出数量较多时，工具会走 fast batch 模式，复用同一批样本并输出 `assignments_json`，可直接传给 `check_hypothesis` 做全输出验证。
-- `check_hypothesis(assignments, declarations="", sample_num=256, run_cec=True)`：接受 LLM 自己提出的 word-level hypothesis，例如 `{"out3": "in1 * (in2 + in3 + in4) + in5"}`。工具跑样本检查；若覆盖所有输出，还会生成临时 RTL、显式零扩展 word 操作数，并按需跑 CEC。cost 按 compact RTL 计算；若 CEC 用的显式扩展 RTL cost 不同，会在 note 中单独提示。
+- `check_hypothesis(assignments, declarations="", sample_num=256, run_cec=True)`：接受 LLM 自己提出的 word-level hypothesis，例如 `{"out3": "in1 * (in2 + in3 + in4) + in5"}`。工具跑样本检查；若覆盖所有输出，还会生成临时 RTL、显式零扩展 word 操作数，并按需跑 CEC。cost 按 compact RTL 计算；若 CEC 用的显式扩展 RTL cost 不同，会在 note 中单独提示。样本检查器支持 `$signed(...)`、`$unsigned(...)` 和简单 `wire signed [...] name = expr;` 本地声明，但复杂 Verilog signed propagation 仍要通过显式 width/signedness audit 和 CEC 验证。
 - `check_hypothesis(..., share_common=True)`：默认启用保守公共子表达式共享。工具会从重复的加法前缀中生成 `gs_cse*` wires，例如共享 `x + y`、`x + y + k*z`、`... + t` 这类跨输出公共 base，优化后重新跑样本检查，再计算 cost/CEC。共享优化成功后使用 compact width 渲染，避免无谓 `{N'b0, x}` 增加 contest cost。
 - `fit_hypothesis(output, template, unknowns, sample_num=256)`：支持 LLM 自定义模板并求整数系数。小规模未知量使用网格搜索；当未知量组合数爆炸时，若模板对未知量是线性的，会自动切换到大规模 affine solver，可处理几十个系数，例如 `c0*x0 + c1*x1 + ...`。solver 会先用低幅值样本子集提出候选，再用全样本按输出位宽验证，以处理加法树输出回绕。
 - `fit_basis(output, basis, include_constant=True, coefficient_limit=4096, sample_num=256)`：开放式 basis 拟合接口。LLM 提供任意可求值 basis，例如 `["in1", "in2", "in1 * in2", "sel ? in5 : 0", "in8 << 3"]`；工具拟合 `const + Σ ci*basis_i`，并用样本严格验证。遇到新结构时优先扩展 basis，而不是修改内置模板；对大加法树可用分组 selector basis 避免人工枚举所有权重。
@@ -125,7 +132,7 @@ CEC 状态已分级：`proved` 表示严格证明等价，`counterexample` 表�
 
 ### 计划工作流
 
-LLM 先用 `propose_strategy` 获取三通道建议，再用 `run_method` 选择性尝试 `template`、`polynomial` 或 `symbolic`。若候选不合适，先根据 cone、仿真和反例构造 basis，用 `fit_basis` 拟合开放式表达式；若已知具体模板再用 `fit_hypothesis` 求参数；若已有完整公式则用 `check_hypothesis` 验证并让 `share_common` 做公共子表达式共享。CEC 返回反例时，用 `explain_failure` 或 `trace_counterexample` 定位冲突位、相关 cone 和中间项，再调整 basis、切 cone 或切换方法。最终由 LLM 组合多 PO 表达式，调用 `edit(rewrite=...)` 应用 RTL，再用 `dump` 导出。
+LLM 先用 `propose_strategy` 获取三通道建议，再用 `run_method` 选择性尝试 `template`、`polynomial` 或 `symbolic`。若候选不合适，先根据 cone、仿真和反例构造 basis，用 `fit_basis` 拟合开放式表达式；若已知具体模板再用 `fit_hypothesis` 求参数；若已有完整公式则用 `check_hypothesis` 验证并让 `share_common` 做公共子表达式共享。CEC 返回反例时，用 `explain_failure` 或 `trace_counterexample` 定位冲突位、相关 cone 和中间项，再调整 basis、切 cone 或切换方法。最终由 LLM 组合多 PO 表达式，完成三轮不可化简确认后，调用 `edit(rewrite=...)` 应用 RTL，再用 `dump` 导出。
 
 ### 依赖与安装
 

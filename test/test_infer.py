@@ -365,6 +365,45 @@ def test_sample_evaluator_supports_ternary_and_bit_selects():
     assert eval_expr("(sel ? a : b) + 4", env) == 15
 
 
+def test_sample_evaluator_supports_signed_casts():
+    env = {"a": 0xFFF, "b": 0}
+    widths = {"a": 12, "b": 12}
+
+    assert eval_expr("$signed(a) > $signed(b)", env, widths=widths) == 0
+    assert eval_expr("$signed(b) > $signed(a)", env, widths=widths) == 1
+    assert eval_expr("$unsigned(a) > $unsigned(b)", env, widths=widths) == 1
+
+
+def test_check_samples_supports_signed_local_declarations():
+    a = word("a", 12)
+    b = word("b", 12)
+    out = word("y", 1)
+
+    def signed12(value):
+        return value - 4096 if value & 0x800 else value
+
+    samples = synthetic_samples(
+        [a, b],
+        out,
+        lambda row: int(signed12(row["b"]) > signed12(row["a"])),
+        values=[0, 1, 2047, 2048, 4095],
+    )
+    declarations = """
+    wire signed [11:0] sa = a;
+    wire signed [11:0] sb = b;
+    """
+
+    status, mismatches = check_samples(
+        {"y": "sb > sa"},
+        declarations,
+        samples,
+        {"y": out},
+        {"a": a, "b": b},
+    )
+
+    assert status == "pass", mismatches
+
+
 def test_propose_strategy_lists_three_recovery_lanes():
     session = CircuitSession()
     session.load("examples/iccad22_test01.v")
