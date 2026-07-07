@@ -183,206 +183,6 @@ def print_adder_stats(detail: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Word-level hypothesis workflow tools
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def propose_strategy(output: str = "",
-                     detail: bool = False,
-                     budget: dict | None = None) -> str:
-    """Rank recovery lanes for one or all output words.
-
-    Use this at the start of recovery for an output word/group to decide which
-    lane is worth trying first.  The report compares:
-
-    - ``template``: built-in candidates plus LLM-defined basis/template fitting,
-    - ``polynomial``: bounded PO-to-PI structural rewrite,
-    - ``symbolic``: sample-driven symbolic search.
-
-    ``output=""`` summarizes all output words.  ``budget`` may set limits such
-    as ``max_nodes`` and ``max_expr_chars``.
-
-    Returns a prioritization report with support/cone metrics, budget estimates,
-    and recommended method calls.  It is a hint, not a decision authority: it
-    does not create hypotheses, run proof, edit RTL, or change source state.
-    """
-    return session.propose_strategy(
-        output=output, detail=detail, budget=budget)
-
-
-@mcp.tool()
-def run_method(output: str,
-               method: str,
-               sample_num: int = 256,
-               budget: dict | None = None,
-               detail: bool = False) -> str:
-    """Run one recovery lane without editing source code.
-
-    ``method`` accepts:
-
-    - ``template``: delegate to ``infer_candidates`` for this output,
-    - ``polynomial``: expand a bounded PO-to-PI expression and sample-check it,
-    - ``symbolic``: run deterministic word/sketch/grammar searches on samples.
-
-    Returns candidate expressions, sample-check status, hypothesis ids, and
-    budget status such as skipped/expanded/timeout.  Returned expressions are
-    evidence only.  This tool may store hypotheses for later tracing, but it
-    never modifies the current recovered RTL and never proves equivalence.
-    """
-    return session.run_method(
-        output=output,
-        method=method,
-        sample_num=sample_num,
-        budget=budget,
-        detail=detail,
-    )
-
-
-@mcp.tool()
-def explain_failure(hypothesis_id: int | str | None = None,
-                    output: str = "",
-                    depth: int = 3) -> str:
-    """Analyze a failed hypothesis and recommend the next recovery action.
-
-    Use this after ``check_hypothesis``, ``run_method``, or ``infer_candidates``
-    reports a mismatch, counterexample, timeout, or no-fit state.  If
-    ``hypothesis_id`` is omitted, the latest relevant failed hypothesis is used;
-    ``output`` can narrow the report to one output word.
-
-    Returns the failure state, smallest known contradiction when available,
-    likely causes such as width/signedness/selector/missing term, and a suggested
-    next tool call.  It does not edit RTL or prove anything.
-    """
-    return session.explain_failure(
-        hypothesis_id=hypothesis_id, output=output, depth=depth)
-
-
-@mcp.tool()
-def infer_candidates(output: str = "",
-                     methods: list[str] | None = None,
-                     sample_num: int = 256,
-                     detail: bool = False) -> str:
-    """Generate initial word-level expression candidates for output words.
-
-    This is an LLM workbench tool, not an automatic rewrite.  It uses output
-    cones to find support input words, runs deterministic/random samples, and
-    fits built-in arithmetic, bit-selection, comparison, and MUX templates.
-
-    ``output=""`` attempts all output words; for many-output cases it may emit a
-    compact batch ``assignments_json`` map that can be passed directly to
-    ``check_hypothesis``.  ``detail=True`` includes more structure and fit
-    diagnostics.
-
-    Returns support words, cone summaries, candidate expressions, sample-fit
-    status, hypothesis ids, and sometimes ``assignments_json``.  Candidates are
-    stored for tracing but are not proof and do not modify source.
-    """
-    return session.infer_candidates(
-        output=output, methods=methods, sample_num=sample_num, detail=detail)
-
-
-@mcp.tool()
-def check_hypothesis(assignments: dict[str, str],
-                     declarations: str = "",
-                     sample_num: int = 256,
-                     run_cec: bool = True,
-                     share_common: bool = True) -> str:
-    """Check an LLM-proposed word-level hypothesis without editing the source.
-
-    ``assignments`` maps output word names to expressions, for example
-    ``{"out3": "in1 * (in2 + in3 + in4) + in5"}``.  ``declarations`` can add
-    helper wires/regs needed by those expressions, including simple signed
-    helper declarations such as ``wire signed [7:0] sa = a;``.  Sample checking
-    understands ``$signed(...)`` and ``$unsigned(...)`` casts.
-
-    The tool compares samples against the loaded gate-level circuit.  With
-    ``share_common=True`` it conservatively extracts repeated additive
-    subexpressions into local wires, re-checks samples, and then computes
-    cost/CEC on the shared form.  If every output word is assigned and
-    ``run_cec`` is true, it renders temporary RTL and runs CEC; partial-output
-    hypotheses are sample-checked but CEC is skipped.
-
-    Returns sample status, mismatches or CEX information, CEC status when run,
-    rendered/costed RTL notes, and contest cost.  It does not modify the current
-    recovered source; use ``edit`` to apply a proved rewrite.
-    """
-    return session.check_hypothesis(
-        assignments=assignments, declarations=declarations,
-        sample_num=sample_num, run_cec=run_cec, share_common=share_common,
-    )
-
-
-@mcp.tool()
-def fit_hypothesis(output: str,
-                   template: str,
-                   unknowns: list[str] | dict | None = None,
-                   sample_num: int = 256) -> str:
-    """Fit integer coefficients for an LLM-proposed expression template.
-
-    ``template`` should reference real input word names and unknown identifiers.
-    ``unknowns`` may be a list (default domains) or a mapping such as
-    ``{"c": {"min": -512, "max": 512}, "a": [-1, 0, 1]}``.  Small problems use
-    grid search; large affine templates such as ``c0*x0 + c1*x1 + ...`` are
-    solved directly instead of enumerating all coefficient combinations.
-
-    Returns solved coefficients and an expression, or a no-fit/budget reason
-    with sample diagnostics.  The fitted expression is a candidate only; this
-    tool does not edit source or run full-module proof.
-    """
-    return session.fit_hypothesis(
-        output=output, template=template, unknowns=unknowns,
-        sample_num=sample_num,
-    )
-
-
-@mcp.tool()
-def fit_basis(output: str,
-              basis: list[str],
-              include_constant: bool = True,
-              coefficient_limit: int = 4096,
-              sample_num: int = 256) -> str:
-    """Fit an LLM-supplied expression basis for one output word.
-
-    This is the open-ended alternative to adding more built-in templates.  The
-    model proposes basis terms such as ``["in1", "in2", "in1 * in2",
-    "sel ? in5 : 0", "in8 << 3"]``; GateSpy solves
-    ``const + sum(coeff_i * basis_i)`` and verifies the resulting expression on
-    samples.
-
-    Returns coefficients, a fitted expression, sample status, and no-fit reasons
-    when applicable.  Use ``check_hypothesis`` on the returned expression before
-    edit; this tool does not change source.
-    """
-    return session.fit_basis(
-        output=output,
-        basis=basis,
-        include_constant=include_constant,
-        coefficient_limit=coefficient_limit,
-        sample_num=sample_num,
-    )
-
-
-@mcp.tool()
-def trace_counterexample(hypothesis_id: int | str | None = None,
-                         output: str = "",
-                         bits: list[int] | None = None,
-                         depth: int = 3) -> str:
-    """Replay a failed hypothesis and report mismatch-focused debug context.
-
-    Use this after a sample mismatch or CEC counterexample.  If
-    ``hypothesis_id`` is omitted, the latest failed hypothesis is used.
-    ``output`` and ``bits`` narrow the trace; ``depth`` controls related cone
-    context.
-
-    Returns mismatch output bits/words, input valuation, old/new values, watched
-    candidate subterms when available, and fan-in cone hints.  It is for
-    diagnosis only and does not edit or prove the design.
-    """
-    return session.trace_counterexample(
-        hypothesis_id=hypothesis_id, output=output, bits=bits, depth=depth)
-
-
-# ---------------------------------------------------------------------------
 #  Code-modification workflow tools
 # ---------------------------------------------------------------------------
 
@@ -393,9 +193,8 @@ def edit(
     rewrite: str = "",
     begin: str = "",
     end: str = "",
-    accept_timeout: bool = False,
 ) -> str:
-    """Apply a verified edit to the current recovered Verilog source code.
+    """Apply string replacements to the current Verilog source code.
 
     Three modes, evaluated in priority order:
 
@@ -413,33 +212,25 @@ def edit(
        Each string in ``matches`` must appear **exactly once** in the
        current code.  Replacements are applied in order.
 
-    For multi-output modules, provide complete RTL or preserve every existing
-    output explicitly.  Partial rewrites can leave outputs at default values and
-    create misleading counterexamples.
-
-    After applying the temporary edit, CEC verifies functional equivalence
-    between the old and new code.  If it fails (syntax error or functional
-    mismatch) the edit is **rejected** — the current code is NOT changed and
-    nothing is recorded.  Timeout is also rejected unless
-    ``accept_timeout=True`` is set.
+    After applying, Yosys CEC verifies functional equivalence between the
+    old and new code.  If it fails (syntax error or functional mismatch) the
+    edit is **rejected** — the current code is NOT changed and nothing is
+    recorded.
 
     On success the ICCAD-2022-Problem-A cost is computed and the edit is
     recorded so it can be reverted later with ``revert``.
 
-    Returns accepted/rejected status, CEC state, cost before/after, reduction
-    rate, and modification id when accepted.  This is the only hypothesis
-    workflow tool that modifies current recovered source.
+    Returns a structured report with cost, reduction rate, and status.
     """
     return session.edit(
         matches=matches, replacements=replacements,
         rewrite=rewrite, begin=begin, end=end,
-        accept_timeout=accept_timeout,
     )
 
 
 @mcp.tool()
 def revert(depth: int = 1, id: int = 0, help: bool = False) -> str:
-    """Revert accepted edits or show the modification history.
+    """Revert previous edits or show the modification history.
 
     Parameters
     ----------
@@ -452,27 +243,23 @@ def revert(depth: int = 1, id: int = 0, help: bool = False) -> str:
         Revert to this modification id — all edits with id >= *id* are
         dropped.  Use *id* to jump back to a specific state.  ``id=0``
         means "not set" (the *depth* parameter is used instead).
-
-    Returns either the edit history table or a confirmation of the restored
-    source state.  It only affects edits previously accepted by ``edit``.
     """
     return session.revert(depth=depth, id=id, help=help)
 
 
 @mcp.tool()
 def dump(path: str) -> str:
-    """Write the current accepted Verilog source code to *path*.
+    """Write the current Verilog source code to *path*.
 
-    Use this only after proof and cost audit.  ``dump`` does not run CEC,
-    compute cost, or decide whether the current source is solved; it simply
-    writes the current session source and returns a confirmation with file size.
+    Use this to save the latest (modified) code to a file after a series of
+    successful edits.  Returns a confirmation with file size.
     """
     return session.dump(path)
 
 
 @mcp.tool()
 def show(detail: bool = False, grep: str = "") -> str:
-    """Return the current recovered Verilog source code with optional filtering.
+    """Return the current Verilog source code with optional filtering.
 
     Parameters
     ----------
@@ -484,9 +271,6 @@ def show(detail: bool = False, grep: str = "") -> str:
         A regex pattern.  When non-empty, only matching lines are shown,
         each with ±5 lines of surrounding context.  Overlapping context
         windows are merged.  Ignores *detail* when set.
-
-    Returns source text only.  It is the preferred way to re-read the current
-    RTL before cost audit or ``dump``; it does not run proof or modify state.
     """
     return session.show(detail=detail, grep=grep)
 

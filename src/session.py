@@ -16,31 +16,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .circuit import Circuit, extract_adders, extract_xor
-from .circuit.infer import (
-    HypothesisRecord,
-    PolynomialBudget,
-    SymbolicBudget,
-    check_samples,
-    collect_words,
-    fit_builtin_candidates,
-    fit_basis_candidates,
-    fit_custom_template,
-    format_strategy_report,
-    format_words,
-    io_words,
-    optimise_shared_wires,
-    polynomial_rewrite_word,
-    propose_output_strategy,
-    render_hypothesis_rtl,
-    simulate_samples,
-    support_words,
-    symbolic_regression_candidates,
-    trace_hypothesis_counterexample,
-)
-from .circuit.infer.words import cone_gate_histogram
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +229,6 @@ class CircuitSession:
         self._modifications: list[ModificationRecord] = []
         self._mod_counter: int = 0
         self._original_gate_count: int = 0
-        self._hypotheses: list[HypothesisRecord] = []
-        self._hyp_counter: int = 0
 
     # -- operations -----------------------------------------------------
 
@@ -296,8 +271,6 @@ class CircuitSession:
             self._original_gate_count = len(circuit.gate_nodes)
         self._modifications = []
         self._mod_counter = 0
-        self._hypotheses = []
-        self._hyp_counter = 0
 
         return self._load_report(fmt)
 
@@ -770,658 +743,6 @@ class CircuitSession:
 
 
     # ------------------------------------------------------------------
-    # Word-level hypothesis workflow
-    # ------------------------------------------------------------------
-
-    def _io_words(self):
-        return io_words(self._current())
-
-    def _next_hypothesis(self, assignments: dict[str, str],
-                         declarations: str = "", rtl: str = "",
-                         note: str = "") -> HypothesisRecord:
-        self._hyp_counter += 1
-        rec = HypothesisRecord(
-            id=self._hyp_counter,
-            assignments=dict(assignments),
-            declarations=declarations or "",
-            rtl=rtl,
-            note=note,
-        )
-        self._hypotheses.append(rec)
-        return rec
-
-    def _find_hypothesis(self, hypothesis_id: int | str | None = None
-                         ) -> HypothesisRecord | None:
-        if hypothesis_id:
-            hid = int(hypothesis_id)
-            for rec in self._hypotheses:
-                if rec.id == hid:
-                    return rec
-            return None
-        for rec in reversed(self._hypotheses):
-            if rec.sample_mismatches or rec.cec_status in {"counterexample", "error"}:
-                return rec
-        return self._hypotheses[-1] if self._hypotheses else None
-
-    @staticmethod
-    def _cec_status(cec: dict) -> str:
-        reason = cec.get("reason", "")
-        if reason == "equivalent":
-            return "proved"
-        if reason == "counterexample":
-            return "counterexample"
-        if reason == "timeout_assumed_equivalent":
-            return "timeout_assumed"
-        return "error"
-
-    def _format_hypothesis(self, rec: HypothesisRecord) -> str:
-        lines = [
-            f"Hypothesis #{rec.id}",
-            f"    sample_status : {rec.sample_status}",
-            f"    cec_status    : {rec.cec_status}",
-        ]
-        if rec.cost is not None:
-            lines.append(f"    cost          : {rec.cost}")
-        if rec.note:
-            lines.append(f"    note          : {rec.note}")
-        if rec.declarations.strip():
-            lines.append("    declarations:")
-            for line in rec.declarations.strip().splitlines():
-                lines.append(f"      {line}")
-        lines.append("    assignments:")
-        for out, expr in rec.assignments.items():
-            lines.append(f"      {out} = {expr}")
-        if rec.sample_mismatches:
-            lines.append("    sample mismatches:")
-            for mm in rec.sample_mismatches[:4]:
-                if "error" in mm:
-                    lines.append(f"      error: {mm['error']}")
-                else:
-                    lines.append(
-                        f"      sample {mm['sample']} {mm['output']}: "
-                        f"expected {mm['expected']}, got {mm['actual']}, "
-                        f"inputs={mm['inputs']}"
-                    )
-        if rec.cec:
-            reason = rec.cec.get("reason", "(none)")
-            elapsed = rec.cec.get("elapsed")
-            suffix = f" in {elapsed:.1f}s" if isinstance(elapsed, (int, float)) else ""
-            lines.append(f"    cec_reason    : {reason}{suffix}")
-            cex = rec.cec.get("counterexample")
-            if cex:
-                for mm in cex.get("mismatches", [])[:4]:
-                    lines.append(
-                        f"      cex mismatch: {mm['po_name']} "
-                        f"old={mm['val_old']} new={mm['val_new']}"
-                    )
-        return "\n".join(lines)
-
-    @staticmethod
-    def _poly_budget_from_dict(budget: dict[str, Any] | None) -> PolynomialBudget:
-        budget = budget or {}
-        return PolynomialBudget(
-            max_nodes=int(budget.get("max_nodes", PolynomialBudget.max_nodes)),
-            max_expr_chars=int(
-                budget.get("max_expr_chars", PolynomialBudget.max_expr_chars)
-            ),
-            max_intermediate_chars=int(
-                budget.get(
-                    "max_intermediate_chars",
-                    PolynomialBudget.max_intermediate_chars,
-                )
-            ),
-        )
-
-    @staticmethod
-    def _symbolic_budget_from_dict(budget: dict[str, Any] | None) -> SymbolicBudget:
-        budget = budget or {}
-        return SymbolicBudget(
-            max_expr_size=int(
-                budget.get("max_expr_size", SymbolicBudget.max_expr_size)
-            ),
-            beam_width=int(budget.get("beam_width", SymbolicBudget.beam_width)),
-            max_expr_chars=int(
-                budget.get("max_expr_chars", SymbolicBudget.max_expr_chars)
-            ),
-            max_inputs=int(budget.get("max_inputs", SymbolicBudget.max_inputs)),
-            max_support_bits=int(
-                budget.get(
-                    "max_support_bits",
-                    SymbolicBudget.max_support_bits,
-                )
-            ),
-            max_pair_candidates=int(
-                budget.get(
-                    "max_pair_candidates",
-                    SymbolicBudget.max_pair_candidates,
-                )
-            ),
-            max_shift=int(budget.get("max_shift", SymbolicBudget.max_shift)),
-        )
-
-    def propose_strategy(self, output: str = "",
-                         detail: bool = False,
-                         budget: dict[str, Any] | None = None) -> str:
-        """Rank template / polynomial / symbolic lanes for output recovery."""
-        c = self._current()
-        input_words, output_words = self._io_words()
-        if output and output not in output_words:
-            raise KeyError(
-                f"{output!r} is not an output word; available: "
-                + ", ".join(output_words)
-            )
-        targets = [output_words[output]] if output else list(output_words.values())
-        poly_budget = self._poly_budget_from_dict(budget)
-        strategies = [
-            propose_output_strategy(c, out_word, input_words, poly_budget)
-            for out_word in targets
-        ]
-        return format_strategy_report(strategies, detail=detail)
-
-    def run_method(self, output: str,
-                   method: str,
-                   sample_num: int = 256,
-                   budget: dict[str, Any] | None = None,
-                   detail: bool = False) -> str:
-        """Run one recovery lane without directly editing current source."""
-        method_key = method.strip().lower().replace("-", "_")
-        if method_key in {"template", "templates", "fit", "candidate"}:
-            return self.infer_candidates(
-                output=output, sample_num=sample_num, detail=detail)
-
-        c = self._current()
-        input_words, output_words = self._io_words()
-        if not output:
-            raise ValueError("run_method requires output for non-template lanes")
-        if output not in output_words:
-            raise KeyError(
-                f"{output!r} is not an output word; available: "
-                + ", ".join(output_words)
-            )
-        out_word = output_words[output]
-        support = support_words(c, out_word, input_words)
-
-        if method_key in {"polynomial", "poly", "polynomial_rewrite", "rewrite"}:
-            poly_budget = self._poly_budget_from_dict(budget)
-            estimate = propose_output_strategy(c, out_word, input_words, poly_budget)[
-                "polynomial_estimate"
-            ]
-            lines = [
-                f"Method run: polynomial_rewrite for {output}",
-                f"    estimate feasible : {estimate['feasible']}",
-                f"    estimated chars   : {estimate['estimated_chars']}",
-                f"    reconvergence     : {estimate['reconvergence']}",
-            ]
-            if not estimate["feasible"] and not (budget or {}).get("force"):
-                lines.extend([
-                    "    status            : skipped_budget",
-                    "    message           : polynomial rewrite estimate is over budget",
-                    "    next              : cut the cone, use fit_basis, try template, "
-                    "or rerun with budget={\"force\": true, ...}",
-                ])
-                for reason in estimate.get("reasons", [])[:4]:
-                    lines.append(f"      reason: {reason}")
-                return "\n".join(lines)
-
-            fit = polynomial_rewrite_word(c, out_word, poly_budget)
-            lines.append(f"    status            : {fit.get('status')}")
-            if fit.get("status") != "fit":
-                lines.append(f"    message           : {fit.get('message')}")
-                lines.append(
-                    "    next              : cut the cone, use fit_basis, or "
-                    "try symbolic with a tighter support set"
-                )
-                return "\n".join(lines)
-
-            samples = simulate_samples(
-                c, input_words, {output: out_word}, sample_num=sample_num)
-            sample_status, mismatches = check_samples(
-                {output: fit["expr"]}, "", samples, {output: out_word}, input_words)
-            rec = self._next_hypothesis(
-                {output: fit["expr"]},
-                note="run_method:polynomial_rewrite",
-            )
-            rec.sample_status = sample_status
-            rec.sample_mismatches = mismatches
-            rec.cec_status = (
-                "not_run_candidate_only"
-                if sample_status == "pass"
-                else "skipped_sample_failed"
-            )
-            lines.extend([
-                f"    hypothesis #{rec.id}: {output} = {fit['expr']}",
-                f"    expr_chars        : {fit.get('expr_chars')}",
-                f"    expanded_nodes    : {fit.get('expanded_nodes')}",
-                f"    sample_status     : {sample_status}",
-                f"    cec_status        : {rec.cec_status}",
-            ])
-            if mismatches:
-                lines.append("    sample mismatches:")
-                for mm in mismatches[:4]:
-                    if "error" in mm:
-                        lines.append(f"      error: {mm['error']}")
-                    else:
-                        lines.append(
-                            f"      sample {mm['sample']} {mm['output']}: "
-                            f"expected={mm['expected']} actual={mm['actual']} "
-                            f"inputs={mm['inputs']}"
-                        )
-            return "\n".join(lines)
-
-        if method_key in {"symbolic", "symbolic_regression", "sr"}:
-            sym_budget = self._symbolic_budget_from_dict(budget)
-            samples = simulate_samples(
-                c, input_words, {output: out_word}, sample_num=sample_num)
-            fit = symbolic_regression_candidates(
-                samples, out_word, support, budget=sym_budget)
-            lines = [
-                f"Method run: symbolic_regression for {output}",
-                f"    support : {format_words(support)}",
-                f"    status  : {fit.get('status')}",
-                f"    samples : {fit.get('samples', sample_num)}",
-            ]
-            if fit.get("status") == "fit":
-                rec = self._next_hypothesis(
-                    {output: fit["expr"]},
-                    note="run_method:symbolic_regression",
-                )
-                rec.sample_status = "pass"
-                rec.cec_status = "not_run_candidate_only"
-                lines.extend([
-                    f"    hypothesis #{rec.id}: {output} = {fit['expr']}",
-                    f"    expr_size : {fit.get('expr_size')}",
-                    "    next      : combine with other outputs and run "
-                    "check_hypothesis for CEC refinement",
-                ])
-            else:
-                msg = fit.get("message")
-                if msg:
-                    lines.append(f"    message : {msg}")
-                if fit.get("nearest"):
-                    lines.append("    nearest sample matches:")
-                    for item in fit["nearest"]:
-                        lines.append(
-                            f"      {item['matching_samples']}/{fit.get('samples', sample_num)} "
-                            f"size={item['expr_size']} expr={item['expr']}"
-                        )
-                lines.append(
-                    "    next    : add LLM-designed basis terms, increase budget, "
-                    "or use trace_counterexample after a failed full hypothesis"
-                )
-            return "\n".join(lines)
-
-        raise ValueError(
-            "unknown method; use template, polynomial, or symbolic"
-        )
-
-    def explain_failure(self, hypothesis_id: int | str | None = None,
-                        output: str = "",
-                        depth: int = 3) -> str:
-        """Explain the latest failed hypothesis and suggest next method steps."""
-        rec = self._find_hypothesis(hypothesis_id)
-        if rec is None:
-            return "No hypotheses have been checked yet."
-        lines = [
-            f"Failure analysis for hypothesis #{rec.id}",
-            f"    sample_status : {rec.sample_status}",
-            f"    cec_status    : {rec.cec_status}",
-        ]
-        if rec.note:
-            lines.append(f"    note          : {rec.note}")
-        if rec.sample_status == "mismatch":
-            lines.append(
-                "    diagnosis     : the expression is already contradicted by "
-                "samples; inspect missing terms, selector polarity, constants, "
-                "and output width before running CEC again"
-            )
-        elif rec.cec_status == "counterexample":
-            lines.append(
-                "    diagnosis     : samples passed but formal CEC found a "
-                "counterexample; use the CEX as a new targeted sample and "
-                "adjust basis/template around the mismatching bit"
-            )
-        elif rec.cec_status == "timeout_assumed":
-            lines.append(
-                "    diagnosis     : timeout is not proof; reduce expression "
-                "complexity, split outputs, or seek a cheaper shared form"
-            )
-        elif rec.cec_status == "error":
-            lines.append(
-                "    diagnosis     : verification or RTL rendering failed; "
-                "check syntax, widths, and unsupported operators first"
-            )
-        else:
-            lines.append(
-                "    diagnosis     : no hard failure is recorded; use cost audit "
-                "or a stricter full-output check if the expression looks bloated"
-            )
-
-        lines.append("")
-        lines.append(trace_hypothesis_counterexample(
-            self._current(),
-            rec,
-            *self._io_words(),
-            output=output,
-            depth=depth,
-        ))
-        lines.extend([
-            "",
-            "Suggested next actions:",
-            "  1. If mismatch is a constant/weight error, use fit_basis with the missing term.",
-            "  2. If mismatch follows a selector, add explicit MUX basis terms or run polynomial on the selected output.",
-            "  3. If polynomial explodes, cut the cone or use symbolic regression on a smaller support set.",
-            "  4. After any correction, rerun check_hypothesis with CEC before edit.",
-        ])
-        return "\n".join(lines)
-
-    def infer_candidates(self, output: str = "",
-                         methods: list[str] | None = None,
-                         sample_num: int = 256,
-                         detail: bool = False) -> str:
-        """Generate structure- and sample-guided word-level candidates."""
-        c = self._current()
-        input_words, output_words = self._io_words()
-        targets = [output_words[output]] if output else list(output_words.values())
-        if output and output not in output_words:
-            raise KeyError(
-                f"{output!r} is not an output word; available: "
-                + ", ".join(output_words)
-            )
-
-        lines = [
-            "Word-level candidate inference",
-            f"    inputs  : {format_words(list(input_words.values()))}",
-            f"    outputs : {format_words(list(output_words.values()))}",
-            f"    samples : {sample_num}",
-        ]
-        fit_methods = methods
-        if not output and methods is None and len(targets) > 12:
-            fit_methods = [
-                "linear",
-                "affine",
-                "scale_shift",
-                "bitselect",
-                "compare",
-                "mux",
-            ]
-            lines.append(
-                "    batch_methods : fast "
-                "(linear, affine, scale_shift, bitselect, compare, mux)"
-            )
-        batch_assignments: dict[str, str] = {}
-        missing_batch_outputs: list[str] = []
-        shared_samples = (
-            simulate_samples(c, input_words, output_words, sample_num=sample_num)
-            if not output else None
-        )
-        for out_word in targets:
-            support = support_words(c, out_word, input_words)
-            hist = cone_gate_histogram(c, out_word)
-            samples = shared_samples or simulate_samples(
-                c, input_words, {out_word.name: out_word}, sample_num=sample_num)
-            candidates = fit_builtin_candidates(samples, out_word, support, fit_methods)
-            hist_text = ", ".join(f"{k}:{v}" for k, v in hist.items()) or "(none)"
-            lines.extend([
-                "",
-                f"== {out_word.name}[{out_word.width}] ==",
-                f"support : {format_words(support)}",
-                f"cone    : {hist_text}",
-            ])
-            if not candidates:
-                lines.append("candidates: none fitted; try check_hypothesis or fit_hypothesis with a custom template")
-                if not output:
-                    missing_batch_outputs.append(out_word.name)
-                continue
-            if not output:
-                batch_assignments[out_word.name] = candidates[0]["expr"]
-            for cand in candidates[:6 if detail else 3]:
-                rec = self._next_hypothesis(
-                    {out_word.name: cand["expr"]},
-                    note=f"infer_candidates:{cand['method']}",
-                )
-                rec.sample_status = "pass"
-                rec.cec_status = "not_run_candidate_only"
-                score = cand.get("score", "?")
-                lines.append(
-                    f"candidate #{rec.id}: {out_word.name} = {cand['expr']} "
-                    f"(method={cand['method']}, score={score}, cec=not_run_candidate_only)"
-                )
-                if detail:
-                    for key, value in cand.items():
-                        if key not in {"expr", "method", "output"}:
-                            lines.append(f"  {key}: {value}")
-        if not output and batch_assignments:
-            samples = shared_samples or simulate_samples(
-                c, input_words, output_words, sample_num=sample_num)
-            sample_status, mismatches = check_samples(
-                batch_assignments, "", samples, output_words, input_words)
-            rec = self._next_hypothesis(
-                batch_assignments,
-                note="infer_candidates:batch_top",
-            )
-            rec.sample_status = sample_status
-            rec.sample_mismatches = mismatches
-            rec.cec_status = (
-                "not_run_candidate_only"
-                if sample_status == "pass"
-                else "skipped_sample_failed"
-            )
-            if missing_batch_outputs:
-                rec.note = (
-                    "batch top candidates missing outputs: "
-                    + ", ".join(missing_batch_outputs)
-                )
-            lines.extend([
-                "",
-                "== batch top assignments ==",
-                f"hypothesis #{rec.id}",
-                f"assigned_outputs : {len(batch_assignments)}/{len(output_words)}",
-                f"sample_status    : {sample_status}",
-                f"cec_status       : {rec.cec_status}",
-            ])
-            if missing_batch_outputs:
-                lines.append("missing_outputs  : " + ", ".join(missing_batch_outputs))
-            if mismatches:
-                lines.append("sample mismatches:")
-                for mm in mismatches[:4]:
-                    if "error" in mm:
-                        lines.append(f"  error: {mm['error']}")
-                    else:
-                        lines.append(
-                            f"  sample {mm['sample']} {mm['output']}: "
-                            f"expected={mm['expected']} actual={mm['actual']} "
-                            f"inputs={mm['inputs']}"
-                        )
-            lines.append("assignments_json:")
-            lines.append(json.dumps(batch_assignments, indent=2, sort_keys=True))
-        return "\n".join(lines)
-
-    def check_hypothesis(self, assignments: dict[str, str],
-                         declarations: str = "",
-                         sample_num: int = 256,
-                         run_cec: bool = True,
-                         share_common: bool = True) -> str:
-        """Check an LLM-proposed hypothesis without modifying current source."""
-        if not self._current_code:
-            raise RuntimeError("no Verilog code loaded; call read_file(path) first")
-        if not assignments:
-            raise ValueError("assignments must name at least one output word")
-
-        c = self._current()
-        input_words, output_words = self._io_words()
-        unknown = [name for name in assignments if name not in output_words]
-        if unknown:
-            raise KeyError(
-                "unknown output assignment(s): "
-                + ", ".join(unknown)
-                + f"; available outputs: {', '.join(output_words)}"
-            )
-
-        samples = simulate_samples(
-            c, input_words, output_words, sample_num=sample_num)
-        sample_status, mismatches = check_samples(
-            assignments, declarations, samples, output_words, input_words)
-
-        rec = self._next_hypothesis(assignments, declarations)
-        rec.sample_status = sample_status
-        rec.sample_mismatches = mismatches
-
-        missing_outputs = [name for name in output_words if name not in assignments]
-        if missing_outputs:
-            rec.cec_status = "skipped_partial_outputs"
-            rec.note = "CEC skipped because assignments do not cover: " + ", ".join(missing_outputs)
-            return self._format_hypothesis(rec)
-
-        if sample_status != "pass":
-            rec.cec_status = "skipped_sample_failed"
-            rec.note = "CEC skipped because sample checking did not pass"
-            return self._format_hypothesis(rec)
-
-        use_compact_widths = False
-        if share_common:
-            opt_declarations, opt_assignments, opt_stats = optimise_shared_wires(
-                assignments, declarations, input_words, output_words)
-            if opt_stats.get("shared_count"):
-                opt_status, opt_mismatches = check_samples(
-                    opt_assignments, opt_declarations, samples, output_words, input_words)
-                if opt_status == "pass":
-                    rec.declarations = opt_declarations
-                    rec.assignments = opt_assignments
-                    shared = ", ".join(
-                        f"{item['name']}={item['expr']}"
-                        for item in opt_stats.get("shared_wires", [])[:8]
-                    )
-                    suffix = "" if len(opt_stats.get("shared_wires", [])) <= 8 else ", ..."
-                    rec.note = (
-                        f"shared {opt_stats['shared_count']} common expression(s): "
-                        + shared
-                        + suffix
-                    )
-                    assignments = opt_assignments
-                    declarations = opt_declarations
-                    use_compact_widths = True
-                else:
-                    rec.note = "shared-wire optimization skipped because sample check failed"
-                    rec.sample_mismatches = opt_mismatches
-
-        rec.rtl = render_hypothesis_rtl(
-            c.name or "top", input_words, output_words, assignments, declarations,
-            extend_widths=not use_compact_widths)
-        cost_rtl = render_hypothesis_rtl(
-            c.name or "top", input_words, output_words, assignments, declarations,
-            extend_widths=False)
-        rec.cost = self._compute_cost(cost_rtl)
-        if not use_compact_widths:
-            proof_cost = self._compute_cost(rec.rtl)
-            if proof_cost != rec.cost:
-                cost_note = (
-                    "cost computed on compact RTL; CEC RTL with explicit "
-                    f"width extensions would cost {proof_cost}"
-                )
-                rec.note = f"{rec.note}; {cost_note}" if rec.note else cost_note
-
-        if run_cec:
-            rec.cec = self._run_cec(self._current_code, rec.rtl)
-            rec.cec_status = self._cec_status(rec.cec)
-        else:
-            rec.cec_status = "not_run"
-        return self._format_hypothesis(rec)
-
-    def fit_hypothesis(self, output: str, template: str,
-                       unknowns: list[str] | dict | None = None,
-                       sample_num: int = 256) -> str:
-        """Fit integer parameters for an LLM-proposed output template."""
-        c = self._current()
-        input_words, output_words = self._io_words()
-        if output not in output_words:
-            raise KeyError(
-                f"{output!r} is not an output word; available: "
-                + ", ".join(output_words)
-            )
-        samples = simulate_samples(
-            c, input_words, {output: output_words[output]}, sample_num=sample_num)
-        fit = fit_custom_template(samples, output_words[output], template, unknowns)
-        lines = [
-            f"Template fit for {output}",
-            f"    status  : {fit.get('status')}",
-            f"    samples : {fit.get('samples', sample_num)}",
-        ]
-        if fit.get("status") == "fit":
-            rec = self._next_hypothesis(
-                {output: fit["expr"]},
-                note="fit_hypothesis:custom_template",
-            )
-            rec.sample_status = "pass"
-            rec.cec_status = "not_run_candidate_only"
-            lines.append(f"    hypothesis #{rec.id}: {output} = {fit['expr']}")
-            lines.append(f"    coefficients : {fit.get('coefficients')}")
-        else:
-            msg = fit.get("message")
-            if msg:
-                lines.append(f"    message : {msg}")
-        return "\n".join(lines)
-
-    def fit_basis(self, output: str, basis: list[str],
-                  include_constant: bool = True,
-                  coefficient_limit: int = 4096,
-                  sample_num: int = 256) -> str:
-        """Fit an LLM-supplied linear combination of arbitrary basis terms."""
-        c = self._current()
-        input_words, output_words = self._io_words()
-        if output not in output_words:
-            raise KeyError(
-                f"{output!r} is not an output word; available: "
-                + ", ".join(output_words)
-            )
-        samples = simulate_samples(
-            c, input_words, {output: output_words[output]}, sample_num=sample_num)
-        fit = fit_basis_candidates(
-            samples,
-            output_words[output],
-            basis,
-            include_constant=include_constant,
-            coefficient_limit=coefficient_limit,
-        )
-        lines = [
-            f"Basis fit for {output}",
-            f"    status  : {fit.get('status')}",
-            f"    samples : {fit.get('samples', sample_num)}",
-        ]
-        if fit.get("status") == "fit":
-            rec = self._next_hypothesis(
-                {output: fit["expr"]},
-                note="fit_basis:llm_basis",
-            )
-            rec.sample_status = "pass"
-            rec.cec_status = "not_run_candidate_only"
-            lines.append(f"    hypothesis #{rec.id}: {output} = {fit['expr']}")
-            lines.append(f"    constant : {fit.get('constant')}")
-            lines.append("    coefficients:")
-            for basis_expr, coeff in fit.get("coefficients", {}).items():
-                if coeff:
-                    lines.append(f"      {coeff} * ({basis_expr})")
-        else:
-            msg = fit.get("message")
-            if msg:
-                lines.append(f"    message : {msg}")
-        return "\n".join(lines)
-
-    def trace_counterexample(self, hypothesis_id: int | str | None = None,
-                             output: str = "",
-                             bits: list[int] | None = None,
-                             depth: int = 3) -> str:
-        """Replay the latest failed hypothesis or a specific hypothesis id."""
-        rec = self._find_hypothesis(hypothesis_id)
-        if rec is None:
-            return "No hypotheses have been checked yet."
-        input_words, output_words = self._io_words()
-        return trace_hypothesis_counterexample(
-            self._current(), rec, input_words, output_words,
-            output=output, bits=bits, depth=depth,
-        )
-
-
-    # ------------------------------------------------------------------
     # Code-modification workflow: edit / revert / show / dump
     # ------------------------------------------------------------------
 
@@ -1432,7 +753,6 @@ class CircuitSession:
         rewrite: str = "",
         begin: str = "",
         end: str = "",
-        accept_timeout: bool = False,
     ) -> str:
         """Apply transformations to the current Verilog source code.
 
@@ -1452,9 +772,8 @@ class CircuitSession:
            Each string in *matches* must appear **exactly once**.
            Replacements are applied in order (existing behaviour).
 
-        On success the edit passes ABC CEC, cost is computed, and the
+        On success the edit passes Yosys CEC, cost is computed, and the
         modification is recorded.  Failed edits are rejected and not recorded.
-        ABC timeout is not accepted unless *accept_timeout* is True.
         """
         if not self._current_code:
             raise RuntimeError(
@@ -1483,14 +802,10 @@ class CircuitSession:
 
         # -- CEC verification ---------------------------------------------------
         cec = self._run_cec(old_code, new_code)
-        cec_status = self._cec_status(cec)
-        if cec_status != "proved" and not (
-            cec_status == "timeout_assumed" and accept_timeout
-        ):
+        if not cec["success"]:
             lines = [
                 "EDIT REJECTED — functional equivalence check failed",
                 f"    reason: {cec['reason']}",
-                f"    status: {cec_status}",
             ]
             # Include counterexample details when available.
             cex = cec.get("counterexample")
@@ -1524,7 +839,7 @@ class CircuitSession:
                         + " ".join(f"{k}={v}" for k, v in sorted(pat.items()))
                     )
             lines.append("    details:")
-            lines.extend("      " + l for l in cec.get("output", "").splitlines()[-5:])
+            lines.extend("      " + l for l in cec["output"].splitlines()[-5:])
             return "\n".join(lines)
 
         # -- Cost ---------------------------------------------------------------
@@ -1550,12 +865,9 @@ class CircuitSession:
             if self._original_gate_count > 0 else 0
         )
         lines = [
-            "EDIT ACCEPTED — equivalence verified"
-            if cec_status == "proved"
-            else "EDIT ACCEPTED — CEC timeout explicitly accepted",
+            "EDIT ACCEPTED — equivalence verified",
             f"    modification #{rec.id}",
             f"    mode        : {mode}",
-            f"    cec status  : {cec_status}",
             f"    cost before : {cost_before}",
             f"    cost after  : {cost_after}",
             f"    reduction   : {reduction:.1f}%",
@@ -1657,9 +969,8 @@ class CircuitSession:
         includes a ``counterexample`` key with a human-readable description
         that is fed back to the LLM.
 
-        The underlying script reports timeout as ``success=True`` with reason
-        ``timeout_assumed_equivalent``.  Callers must classify that reason
-        separately; ``edit`` does not accept it by default.
+        Timeout is treated as **success** — the SAT-based equivalence check
+        only times out when it cannot find a counterexample (UNSAT).
         """
         old_fd, old_path = tempfile.mkstemp(suffix=".v", prefix="cec_old_")
         new_fd, new_path = tempfile.mkstemp(suffix=".v", prefix="cec_new_")
@@ -1677,53 +988,7 @@ class CircuitSession:
                  "--timeout", "310"],
                 capture_output=True, text=True, timeout=320,
             )
-            result = json.loads(proc.stdout.strip())
-            if result.get("reason") == "counterexample":
-                yosys_cec = str(
-                    Path(__file__).resolve().parents[1]
-                    / "scripts"
-                    / "yosys_cec.py"
-                )
-                yproc = subprocess.run(
-                    ["python", yosys_cec, old_path, new_path, "--json",
-                     "--timeout", "120"],
-                    capture_output=True, text=True, timeout=130,
-                )
-                try:
-                    yresult = json.loads(yproc.stdout.strip())
-                except json.JSONDecodeError:
-                    yresult = {
-                        "success": False,
-                        "reason": "yosys_cec_error",
-                        "output": (yproc.stdout or "") + "\n" + (yproc.stderr or ""),
-                        "elapsed": 0.0,
-                    }
-                result["crosscheck"] = {
-                    "yosys_success": yresult.get("success"),
-                    "yosys_reason": yresult.get("reason"),
-                }
-                if yresult.get("success"):
-                    return {
-                        "success": True,
-                        "reason": "equivalent",
-                        "output": (
-                            "ABC reported a counterexample, but Yosys equiv "
-                            "proved equivalence.\n\n"
-                            "ABC output:\n"
-                            + result.get("output", "")
-                            + "\n\nYosys output:\n"
-                            + yresult.get("output", "")
-                        ),
-                        "elapsed": (
-                            float(result.get("elapsed") or 0)
-                            + float(yresult.get("elapsed") or 0)
-                        ),
-                        "crosscheck": {
-                            "abc_reason": result.get("reason"),
-                            "yosys_reason": yresult.get("reason"),
-                        },
-                    }
-            return result
+            return json.loads(proc.stdout.strip())
         except subprocess.TimeoutExpired:
             return {
                 "success": True,
