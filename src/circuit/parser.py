@@ -43,6 +43,14 @@ def _clean_id(name: str) -> str:
     return name[1:].strip() if name.startswith("\\") else name
 
 
+def _header_port_name(text: str) -> str:
+    """Return the base port name from a module header item."""
+    text = re.sub(r"\b(input|output|inout|wire|reg|logic|signed|unsigned)\b", " ", text)
+    text = re.sub(r"\[[^\]]+\]", " ", text)
+    names = re.findall(r"\\\S+|[A-Za-z_][\w$.]*", text)
+    return _clean_id(names[-1]) if names else ""
+
+
 def _parse_range(text: str) -> tuple[int, int]:
     """Parse a ``[msb:lsb]`` declaration into an ``(msb, lsb)`` tuple."""
     msb, lsb = re.findall(r"\d+", text)
@@ -175,10 +183,14 @@ def parse(circuit: Circuit, text: str) -> None:
     ``_add_node``, etc.) deliberately — the parser has always been tightly
     coupled to the Circuit representation.
     """
-    header = re.search(r"\bmodule\s+(\S+)\s*\(.*?\)\s*;", text, re.DOTALL)
+    header = re.search(r"\bmodule\s+(\S+)\s*\((.*?)\)\s*;", text, re.DOTALL)
     if not header:
         raise ValueError("no module declaration found")
     circuit.name = _clean_id(header.group(1))
+    circuit.module_ports = [
+        name for item in _split_top(header.group(2))
+        if (name := _header_port_name(item))
+    ]
 
     body_end = text.rfind("endmodule")
     body = text[header.end():body_end if body_end != -1 else len(text)]

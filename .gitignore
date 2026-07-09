@@ -7,3 +7,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# GateSpy recovery run artifacts
+.gate_spy/runs/
+outputs

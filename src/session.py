@@ -18,6 +18,32 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .circuit import Circuit, extract_adders, extract_xor
+from .circuit.recovery import (
+    ExpressionCandidate,
+    RecoveryReport,
+    RecoveryIRRecorder,
+    TOOL_PROFILES,
+    VerificationResult,
+    analyze_words as _analyze_recovery_words,
+    check_polynomial_lowbits_data,
+    fit_template_data,
+    format_recovery_plan,
+    format_recovery_report,
+    format_word_analysis,
+    get_tool_profile,
+    influence_profile_data,
+    infer_native_expr_data,
+    infer_pysr_expr_data,
+    plan_recovery as _plan_recovery,
+    probe_target_data,
+    recover_rtl_data,
+    split_control_cases_data,
+    validate_expr_data,
+)
+from .circuit.recovery.pipeline import emit_candidate_rtl
+from .circuit.symbolic.parser import expression_identifiers
+from .circuit.symbolic.resolver import build_net_to_node, resolve_field, resolve_inputs
+from .circuit.symbolic.sampler import support_bit_count
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +112,42 @@ def _truncate(s: str, n: int) -> str:
     if len(s) <= n:
         return s
     return s[:n-1] + "..."
+
+
+def _split_port_list(text: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in "[{(":
+            depth += 1
+        elif ch in "]})":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    tail = text[start:]
+    if tail.strip():
+        parts.append(tail)
+    return parts
+
+
+def _module_ports_from_code(code: str) -> list[str]:
+    """Parse top-level module port names for CEC compatibility checks."""
+    match = re.search(r"\bmodule\s+(?:\\\S+|[A-Za-z_]\w*)\s*\((.*?)\)\s*;",
+                      code, re.DOTALL)
+    if not match:
+        return []
+    ports: list[str] = []
+    for raw in _split_port_list(match.group(1)):
+        text = re.sub(r"\b(input|output|inout|wire|reg|logic|signed|unsigned)\b",
+                      " ", raw)
+        text = re.sub(r"\[[^\]]+\]", " ", text)
+        names = re.findall(r"\\\S+|[A-Za-z_][\w$.]*", text)
+        if names:
+            name = names[-1]
+            ports.append(name[1:].strip() if name.startswith("\\") else name)
+    return ports
 
 
 def _split_bit(net: str) -> tuple[str, int | None]:
@@ -219,7 +281,9 @@ class NoCircuitLoadedError(RuntimeError):
 class CircuitSession:
     """Holds the currently loaded circuit and the operations over it."""
 
-    def __init__(self) -> None:
+    def __init__(self, *,
+                 ir_run_base: str | None = None,
+                 recovery_kb_dir: str | None = None) -> None:
         self.circuit: Circuit | None = None
         self.source: str | None = None
 
@@ -229,10 +293,27 @@ class CircuitSession:
         self._modifications: list[ModificationRecord] = []
         self._mod_counter: int = 0
         self._original_gate_count: int = 0
+        self._analysis_seen: bool = False
+        self._recovery_plan_seen: bool = False
+        self._candidate_counter: int = 0
+        self._branch_counter: int = 0
+        self._failed_counter: int = 0
+        self._accepted_candidates: dict[str, ExpressionCandidate] = {}
+        self._branch_candidates: dict[str, ExpressionCandidate] = {}
+        self._failed_candidates: dict[str, ExpressionCandidate] = {}
+        recorder_kwargs = {}
+        if ir_run_base is not None:
+            recorder_kwargs["run_base"] = ir_run_base
+        if recovery_kb_dir is not None:
+            recorder_kwargs["kb_dir"] = recovery_kb_dir
+        self._ir_recorder = RecoveryIRRecorder(**recorder_kwargs)
 
     # -- operations -----------------------------------------------------
 
-    def load(self, path: str) -> str:
+    def load(self, path: str, *,
+             record_ir: bool = False,
+             case_id: str | None = None,
+             out_dir: str | None = None) -> str:
         """Parse *path* into the current circuit and return its summary.
 
         Dispatches on the file extension: ``.v``/``.sv``/``.verilog`` are read
@@ -271,8 +352,25 @@ class CircuitSession:
             self._original_gate_count = len(circuit.gate_nodes)
         self._modifications = []
         self._mod_counter = 0
+        self._analysis_seen = False
+        self._recovery_plan_seen = False
+        self._candidate_counter = 0
+        self._branch_counter = 0
+        self._failed_counter = 0
+        self._accepted_candidates = {}
+        self._branch_candidates = {}
+        self._failed_candidates = {}
+        self._ir_recorder.reset()
 
-        return self._load_report(fmt)
+        report = self._load_report(fmt)
+        if record_ir:
+            run = self._ir_recorder.start(
+                circuit, source_path=path, case_id=case_id, out_dir=out_dir)
+            report += (
+                f"\n    Recovery reasoning graph run       : {run.run_id}"
+                f"\n    Recovery reasoning graph directory : {run.run_dir}"
+            )
+        return report
 
     def _load_report(self, fmt: str) -> str:
         c = self.circuit
@@ -334,6 +432,1128 @@ class CircuitSession:
 
     def node_info(self, ref: str, depth: int = 2, detail: bool = False) -> str:
         return self._current().describe_node(ref, depth, detail=detail)
+
+    def infer_expression(
+        self,
+        targets: list[str] | str,
+        inputs: list[str] | None = None,
+        mode: str = "auto",
+        max_cost: int | None = None,
+        pattern_num: int = 4096,
+        validation_num: int = 16384,
+        seed: int | None = 0,
+        timeout_s: int = 120,
+        niterations: int = 200,
+        detail: bool = False,
+    ) -> str:
+        """Deprecated guardrail for broad expression inference."""
+        return "\n".join([
+            "infer_expression is deprecated for agent-facing recovery.",
+            "    It is a broad symbolic search tool and can bypass the plan/probe/validate workflow.",
+            "    Use recovery_tool_guide(), probe_target(), validate_expr(), fit_template(), or split_control_cases() first.",
+            "    For a branch hypothesis, use validate_expr(..., fixed_inputs={...}).",
+            "    PySR/native enumeration should only be reached through the narrower recovery tools.",
+        ])
+
+    def analyze_words(self, outputs: list[str] | None = None,
+                      max_low_bits: int = 10,
+                      detail: bool = False,
+                      format: str = "text") -> str:
+        """Recover word boundaries and support cuts for RTL recovery."""
+        analysis = _analyze_recovery_words(
+            self._current(), outputs=outputs, max_low_bits=max_low_bits)
+        self._analysis_seen = True
+        self._ir_recorder.log_event(
+            "word_analysis",
+            payload={
+                "params": {
+                    "outputs": outputs,
+                    "max_low_bits": max_low_bits,
+                    "detail": detail,
+                },
+                "analysis": analysis.to_dict(),
+            },
+            tool="analyze_words",
+            status="ok")
+        if format == "json":
+            return json.dumps(analysis.to_dict(), indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        return format_word_analysis(analysis, detail=detail)
+
+    def plan_recovery(self, outputs: list[str] | None = None,
+                      feedback: str | dict | None = None,
+                      detail: bool = False,
+                      format: str = "text") -> str:
+        """Plan an iterative, analysis-driven RTL recovery workflow."""
+        plan = _plan_recovery(self._current(), outputs=outputs, feedback=feedback)
+        self._analysis_seen = True
+        self._recovery_plan_seen = True
+        memory_hints: list[dict] = []
+        for cluster in plan.clusters:
+            target = cluster.outputs[0] if cluster.outputs else cluster.name
+            inputs = [word.split("[", 1)[0] for word in cluster.support_words]
+            memory_hints.extend(self._memory_hits_for(target, inputs, limit=2))
+        self._ir_recorder.record_plan(
+            "plan_recovery",
+            {
+                "outputs": outputs,
+                "feedback": feedback,
+                "detail": detail,
+                "format": format,
+                "memory_hints": memory_hints,
+            },
+            plan)
+        if format == "json" and memory_hints:
+            data = plan.to_dict()
+            data["memory_hints"] = memory_hints
+            return json.dumps(data, indent=2, sort_keys=True)
+        text = format_recovery_plan(plan, detail=detail, format=format)
+        if format == "text" and memory_hints:
+            text += "\n\n== Recovery experience hints ==\n"
+            text += "\n".join(self._format_memory_hits(memory_hints).splitlines()[1:])
+        return text
+
+    def recovery_tool_guide(self, format: str = "text") -> str:
+        """Describe recovery tool effort levels and escalation order."""
+        profiles = [profile.to_dict() for profile in TOOL_PROFILES.values()]
+        if format == "json":
+            return json.dumps(profiles, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        effort_order = {"probe": 0, "verify": 1, "light": 2, "medium": 3, "heavy": 4}
+        lines = ["Recovery tool guide — cheapest sufficient method first"]
+        for profile in sorted(
+            TOOL_PROFILES.values(),
+            key=lambda p: (effort_order.get(p.effort, 99), p.tool),
+        ):
+            lines.append(
+                f"  {profile.tool}: effort={profile.effort} "
+                f"search={profile.search_space} risk={profile.risk}")
+            if profile.requires_hypothesis:
+                lines.append("      requires: explicit hypothesis")
+            if profile.prerequisites:
+                lines.append(f"      prereq  : {', '.join(profile.prerequisites)}")
+            if profile.fallback_after:
+                lines.append(f"      after   : {', '.join(profile.fallback_after)}")
+            if profile.guidance:
+                lines.append(f"      use     : {profile.guidance}")
+        lines.append("")
+        lines.append("Rule: if a formula hypothesis exists, validate_expr is cheaper than any search.")
+        lines.append("Rule: escalate probe -> verify -> light -> medium -> heavy; on failure, shrink before escalating.")
+        return "\n".join(lines)
+
+    def start_recovery_run(self, case_id: str | None = None,
+                           out_dir: str | None = None,
+                           format: str = "text") -> str:
+        """Start a persistent reasoning-graph run for the current circuit."""
+        run = self._ir_recorder.start(
+            self._current(), source_path=self.source, case_id=case_id,
+            out_dir=out_dir)
+        if format == "json":
+            return json.dumps(run.to_dict(), indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        return "\n".join([
+            "Recovery reasoning graph run started",
+            f"    run_id : {run.run_id}",
+            f"    case   : {run.case_id or '(none)'}",
+            f"    dir    : {run.run_dir}",
+            f"    circuit: {run.circuit.circuit_name}",
+            "    files  : graph.json, summary.json, graph.jsonl after first node",
+        ])
+
+    def export_recovery_ir(self, format: str = "json") -> str:
+        """Export the current reasoning-graph snapshot."""
+        data = self._ir_recorder.export()
+        if format == "json":
+            return json.dumps(data, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        if data.get("status") == "no_active_recovery_run":
+            return "No active recovery reasoning graph run."
+        return "\n".join([
+            "Recovery reasoning graph snapshot",
+            f"    run_id : {data.get('run_id')}",
+            f"    case   : {data.get('case_id') or '(none)'}",
+            f"    dir    : {data.get('run_dir')}",
+            f"    nodes  : {data.get('node_count')}",
+        ])
+
+    def record_recovery_graph_node(self, node_type: str,
+                                   target: str = "",
+                                   summary: str = "",
+                                   data: dict | None = None,
+                                   links: list[str] | None = None,
+                                   promotable: bool = False,
+                                   format: str = "text") -> str:
+        """Record one compact reasoning-graph node."""
+        node = self._ir_recorder.add_graph_node(
+            node_type,
+            target=target,
+            summary=summary,
+            data=data,
+            links=links,
+            promotable=promotable)
+        payload = node or {"status": "no_active_recovery_run"}
+        if format == "json":
+            return json.dumps(payload, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        if node is None:
+            return "No active recovery reasoning graph run; node was not recorded."
+        return (
+            f"Recorded reasoning graph node {node['node_id']} "
+            f"type={node_type} target={target or '(none)'}"
+        )
+
+    def query_recovery_experience(self, target: str = "",
+                                  inputs: list[str] | None = None,
+                                  features: dict | None = None,
+                                  limit: int = 5,
+                                  format: str = "text") -> str:
+        """Query local promoted recovery experience without accepting candidates."""
+        hits = self._ir_recorder.query_memory(
+            circuit=self.circuit,
+            target=target,
+            inputs=inputs,
+            features=features,
+            limit=limit)
+        if format == "json":
+            return json.dumps(hits, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        return self._format_memory_hits(hits)
+
+    def query_recovery_memory(self, target: str = "",
+                              inputs: list[str] | None = None,
+                              features: dict | None = None,
+                              limit: int = 5,
+                              format: str = "text") -> str:
+        """Compatibility alias for query_recovery_experience."""
+        return self.query_recovery_experience(
+            target=target,
+            inputs=inputs,
+            features=features,
+            limit=limit,
+            format=format)
+
+    def promote_recovery_experience(self, run_id: str | None = None,
+                                    relation_node_ids: list[str] | None = None,
+                                    problem_node_ids: list[str] | None = None,
+                                    dry_run: bool = True,
+                                    format: str = "text") -> str:
+        """Promote verified reasoning-graph paths into the local experience KB."""
+        result = self._ir_recorder.promote_memory(
+            run_id=run_id,
+            candidate_ids=relation_node_ids,
+            failure_ids=problem_node_ids,
+            dry_run=dry_run)
+        if format == "json":
+            return json.dumps(result, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        lines = [
+            "Recovery experience promotion",
+            f"    mode      : {'dry-run' if dry_run else 'write'}",
+            f"    run       : {result.get('run')}",
+            f"    relations : {result.get('relations', 0)}",
+            f"    experience: {result.get('experiences', 0)}",
+            f"    negative  : {result.get('failures', 0)}",
+        ]
+        if result.get("written"):
+            lines.append(f"    written   : {result['written']}")
+        return "\n".join(lines)
+
+    def promote_recovery_memory(self, run_id: str | None = None,
+                                candidate_ids: list[str] | None = None,
+                                failure_ids: list[str] | None = None,
+                                dry_run: bool = True,
+                                format: str = "text") -> str:
+        """Compatibility alias for promote_recovery_experience.
+
+        ``candidate_ids`` are interpreted as relation graph node ids in the
+        graph-only recorder. ``failure_ids`` are problem graph node ids.
+        """
+        return self.promote_recovery_experience(
+            run_id=run_id,
+            relation_node_ids=candidate_ids,
+            problem_node_ids=failure_ids,
+            dry_run=dry_run,
+            format=format)
+
+    def record_recovery_note(self, kind: str,
+                             target: str = "",
+                             summary: str = "",
+                             refs: list[str] | None = None,
+                             format: str = "text") -> str:
+        """Record model reasoning as unverified IR, never as accepted evidence."""
+        event = self._ir_recorder.record_note(
+            kind=kind, target=target, summary=summary, refs=refs)
+        data = event or {"status": "no_active_recovery_run"}
+        if format == "json":
+            return json.dumps(data, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        if event is None:
+            return "No active recovery reasoning graph run; note was not recorded."
+        return (
+            f"Recorded recovery graph node {event['node_id']} "
+            f"target={target or '(none)'} kind={kind}"
+        )
+
+    @staticmethod
+    def _format_memory_hits(hits: list[dict]) -> str:
+        lines = ["Recovery experience hits"]
+        if not hits:
+            lines.append("  (empty)")
+            lines.append("  Retrieval suggests experiments only; validate any hypothesis before using it.")
+            return "\n".join(lines)
+        for hit in hits:
+            marker = "negative-experience" if hit.get("negative") else hit.get("kind", "experience")
+            lines.append(
+                f"  - [{marker} score={hit.get('score')}] "
+                f"target={hit.get('target') or '(any)'}")
+            if hit.get("relation"):
+                lines.append(f"      relation={hit.get('relation')}")
+            if hit.get("trigger"):
+                lines.append(f"      trigger={hit.get('trigger')}")
+            if hit.get("suggested_experiment"):
+                lines.append(f"      experiment={hit.get('suggested_experiment')}")
+            validation = hit.get("validation") or hit.get("verification")
+            if validation:
+                if isinstance(validation, dict):
+                    validation = validation.get("status") or validation.get("verification") or validation
+                lines.append(f"      validation={validation}")
+            provenance = hit.get("provenance") or {}
+            if isinstance(provenance, dict):
+                run_id = provenance.get("run_id", "")
+                source_node = provenance.get("source_node_id", "")
+                validation_node = provenance.get("validation_node_id", "")
+                if run_id or source_node or validation_node:
+                    lines.append(
+                        f"      provenance=run:{run_id or '?'} source:{source_node or '?'} validation:{validation_node or '?'}")
+            tokens = hit.get("matched_tokens") or []
+            if tokens:
+                lines.append(f"      matched={', '.join(tokens[:8])}")
+        lines.append("  Retrieval suggests experiments only; it never creates accepted candidates.")
+        return "\n".join(lines)
+
+    def _memory_hits_for(self, target: str,
+                         inputs: list[str] | tuple[str, ...] | None = None,
+                         limit: int = 3) -> list[dict]:
+        return self._ir_recorder.query_memory(
+            circuit=self.circuit,
+            target=target,
+            inputs=inputs,
+            limit=limit)
+
+    @staticmethod
+    def _append_memory_notes(report: RecoveryReport,
+                             hits: list[dict]) -> RecoveryReport:
+        if not hits:
+            return report
+        notes = list(report.notes)
+        notes.append(
+            "local recovery experience returned advisory experiment/stop-rule hints; "
+            "retrieval never creates accepted candidates")
+        for hit in hits[:3]:
+            label = "negative-experience" if hit.get("negative") else "experience"
+            relation = hit.get("relation") or hit.get("summary") or hit.get("target")
+            notes.append(
+                f"memory {label} hit score={hit.get('score')}: "
+                f"{relation}")
+        report.notes = tuple(notes)
+        return report
+
+    def _cache_accepted_candidates(self, report: RecoveryReport) -> RecoveryReport:
+        """Assign stable ids to candidates and remember their role."""
+        for cand in report.candidates:
+            if cand.verification.accepted and cand.case_condition:
+                if not cand.candidate_id:
+                    self._branch_counter += 1
+                    cand.candidate_id = f"B{self._branch_counter}"
+                self._branch_candidates[cand.candidate_id] = cand
+                continue
+            if cand.verification.accepted:
+                if not cand.candidate_id:
+                    self._candidate_counter += 1
+                    cand.candidate_id = f"C{self._candidate_counter}"
+                self._accepted_candidates[cand.candidate_id] = cand
+                continue
+            if cand.verification.status.startswith("slice-"):
+                continue
+            if not cand.candidate_id:
+                self._failed_counter += 1
+                cand.candidate_id = f"F{self._failed_counter}"
+            self._failed_candidates[cand.candidate_id] = cand
+        return report
+
+    @staticmethod
+    def _candidate_rows(candidates: dict[str, ExpressionCandidate],
+                        role: str) -> list[dict]:
+        rows: list[dict] = []
+        for cid, cand in candidates.items():
+            rows.append({
+                "id": cid,
+                "role": role,
+                "target": cand.target,
+                "expression": cand.expression,
+                "method": cand.method,
+                "verification": cand.verification.status,
+                "case_condition": cand.case_condition,
+                "inputs": list(cand.inputs),
+                "cost": cand.cost,
+            })
+        return rows
+
+    def list_candidates(self, format: str = "text") -> str:
+        """List accepted, branch-only, and failed local candidates."""
+        rows = (
+            self._candidate_rows(self._accepted_candidates, "accepted-global")
+            + self._candidate_rows(self._branch_candidates, "branch-evidence")
+            + self._candidate_rows(self._failed_candidates, "failed")
+        )
+        if format == "json":
+            return json.dumps(rows, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        lines = ["Candidate cache"]
+        if not rows:
+            lines.append("  (empty)")
+            return "\n".join(lines)
+        for role, title in (
+            ("accepted-global", "Accepted global candidates"),
+            ("branch-evidence", "Branch-only evidence"),
+            ("failed", "Failed candidates"),
+        ):
+            group = [row for row in rows if row["role"] == role]
+            lines.append(f"== {title} ==")
+            if not group:
+                lines.append("  (none)")
+                continue
+            for row in group:
+                cond = f" when {row['case_condition']}" if row["case_condition"] else ""
+                lines.append(
+                    f"  {row['id']}: {row['target']}{cond} = {row['expression']}")
+                lines.append(
+                    f"      method={row['method']} verification={row['verification']} "
+                    f"cost={row['cost']} inputs={', '.join(row['inputs']) or '(none)'}")
+        lines.append("")
+        lines.append("Only C# accepted-global candidates are consumed by assemble_rtl.")
+        lines.append("B# branch evidence must be combined into a full expression first.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _input_base(ref: str) -> str:
+        return ref.split("[", 1)[0]
+
+    def _candidate_aliases(self) -> dict[str, ExpressionCandidate]:
+        aliases: dict[str, ExpressionCandidate] = {}
+        for cid, cand in self._accepted_candidates.items():
+            aliases[cid] = cand
+            aliases[cand.target] = cand
+        return aliases
+
+    def _is_primary_input_ref(self, ref: str) -> bool:
+        net_to_node = build_net_to_node(self._current())
+        try:
+            field = resolve_field(self._current(), ref, net_to_node, role="input")
+        except KeyError:
+            return False
+        return all(self._current().nodes[bit.node_id].is_pi for bit in field.bits)
+
+    def _expand_candidate_refs(self, expression: str,
+                               inputs: list[str] | None
+                               ) -> tuple[str, list[str] | None]:
+        """Inline references to accepted C# candidates or recovered outputs."""
+        aliases = self._candidate_aliases()
+        if not aliases:
+            return expression, inputs
+        expanded = expression
+        resolved_inputs = list(inputs) if inputs is not None else None
+        for _ in range(8):
+            changed = False
+            for name in expression_identifiers(expanded):
+                cand = aliases.get(name)
+                if cand is None:
+                    continue
+                pattern = re.compile(rf"(?<![$A-Za-z0-9_]){re.escape(name)}(?![$A-Za-z0-9_])")
+                expanded_next = pattern.sub(f"({cand.expression})", expanded)
+                if expanded_next == expanded:
+                    continue
+                expanded = expanded_next
+                changed = True
+                if resolved_inputs is None:
+                    resolved_inputs = []
+                seen = {self._input_base(ref) for ref in resolved_inputs}
+                for ref in cand.inputs:
+                    base = self._input_base(ref)
+                    if base not in seen:
+                        resolved_inputs.append(base)
+                        seen.add(base)
+            if not changed:
+                break
+        return expanded, resolved_inputs
+
+    def _complete_expression_inputs(self, expression: str,
+                                    inputs: list[str] | None
+                                    ) -> list[str] | None:
+        """Ensure expression variables are PI inputs, not raw outputs/internal nets."""
+        refs = list(inputs) if inputs is not None else []
+        seen = {self._input_base(ref) for ref in refs}
+        invalid: list[str] = []
+        for name in expression_identifiers(expression):
+            base = self._input_base(name)
+            if base in seen:
+                continue
+            if self._is_primary_input_ref(name):
+                refs.append(name)
+                seen.add(base)
+            else:
+                invalid.append(name)
+        if invalid:
+            names = ", ".join(sorted(set(invalid)))
+            raise ValueError(
+                "expression references non-input or unknown variable(s): "
+                f"{names}. Use only primary inputs and accepted candidates; "
+                "accepted candidates can be referenced by C# id or target name "
+                "after validate_expr/list_candidates confirms them.")
+        return refs
+
+    def _condition_from_fixed(self, fixed_inputs: dict[str, int],
+                              input_widths: dict[str, int]) -> str:
+        parts: list[str] = []
+        for key, raw_value in sorted(fixed_inputs.items()):
+            value = int(raw_value)
+            base = key.split("[", 1)[0]
+            width = input_widths.get(base, 1)
+            if "[" in key:
+                width = 1
+            parts.append(f"{key} == {width}'d{value}")
+        if not parts:
+            return "1'd1"
+        return " && ".join(f"({part})" for part in parts)
+
+    def _combine_case_expression(self, controls: list[str],
+                                 cases: list[dict],
+                                 inputs: list[str] | None) -> tuple[str, list[str] | None]:
+        if not cases:
+            raise ValueError("cases must not be empty")
+        net_to_node = build_net_to_node(self._current())
+        target_stub = resolve_field(self._current(), controls[0], net_to_node, role="input") if controls else None
+        input_refs = list(inputs or [])
+        seen = {self._input_base(ref) for ref in input_refs}
+        for control in controls:
+            base = self._input_base(control)
+            if base not in seen:
+                input_refs.append(base)
+                seen.add(base)
+        for case in cases:
+            fixed = case.get("fixed_inputs") or {}
+            expr = str(case.get("expression") or "")
+            if not expr:
+                raise ValueError("each case must include an expression")
+            for name in expression_identifiers(expr):
+                if name in self._candidate_aliases():
+                    continue
+                if not self._is_primary_input_ref(name):
+                    raise ValueError(
+                        "case expression references non-input or unknown "
+                        f"variable {name!r}; validate and cache it first if it "
+                        "is an intermediate predicate")
+                if name not in seen:
+                    input_refs.append(name)
+                    seen.add(name)
+            for key in fixed:
+                base = self._input_base(str(key))
+                if base not in seen:
+                    input_refs.append(base)
+                    seen.add(base)
+        input_widths: dict[str, int] = {}
+        if input_refs:
+            dummy_target = target_stub or resolve_field(
+                self._current(), input_refs[0], net_to_node, role="input")
+            fields = resolve_inputs(self._current(), input_refs, dummy_target, net_to_node)
+            input_widths = {field.label: field.width for field in fields}
+        combined = ""
+        for idx, case in enumerate(cases):
+            expr = str(case["expression"])
+            expr, input_refs = self._expand_candidate_refs(expr, input_refs)
+            if idx == len(cases) - 1:
+                combined = f"({expr})" if not combined else f"{combined} : ({expr})"
+            else:
+                cond = self._condition_from_fixed(
+                    {str(k): int(v) for k, v in (case.get("fixed_inputs") or {}).items()},
+                    input_widths)
+                prefix = f"({cond}) ? ({expr})"
+                combined = prefix if not combined else f"{combined} : {prefix}"
+        return combined, input_refs
+
+    def probe_target(self, target: str,
+                     inputs: list[str] | None = None,
+                     pattern_num: int = 32,
+                     seed: int | None = 0,
+                     detail: bool = False) -> str:
+        """Profile support/cone/samples for one target without expression search."""
+        self._analysis_seen = True
+        text = probe_target_data(
+            self._current(), target, inputs,
+            pattern_num=pattern_num, seed=seed, detail=detail)
+        self._ir_recorder.record_tool_text(
+            "probe_target",
+            {
+                "target": target,
+                "inputs": inputs,
+                "pattern_num": pattern_num,
+                "seed": seed,
+                "detail": detail,
+            },
+            text,
+            target=target)
+        return text
+
+    def fit_template(self, target: str,
+                     inputs: list[str] | None = None,
+                     templates: str = "linear,product,comparator",
+                     pattern_num: int = 512,
+                     validation_num: int = 2048,
+                     seed: int | None = 0,
+                     exhaustive: str = "auto",
+                     fixed_inputs: dict[str, int] | None = None,
+                     detail: bool = False,
+                     format: str = "text") -> str:
+        """Run restricted template fitting for one target."""
+        memory_hints = self._memory_hits_for(target, inputs, limit=3)
+        report = fit_template_data(
+            self._current(), target, inputs,
+            templates=templates,
+            pattern_num=pattern_num,
+            validation_num=validation_num,
+            seed=seed,
+            exhaustive=exhaustive,
+            fixed_inputs=fixed_inputs,
+            detail=detail,
+        )
+        report = self._append_memory_notes(report, memory_hints)
+        report = self._cache_accepted_candidates(report)
+        self._ir_recorder.record_report(
+            "fit_template",
+            {
+                "target": target,
+                "inputs": inputs,
+                "templates": templates,
+                "pattern_num": pattern_num,
+                "validation_num": validation_num,
+                "seed": seed,
+                "exhaustive": exhaustive,
+                "fixed_inputs": fixed_inputs,
+                "detail": detail,
+                "format": format,
+                "memory_hints": memory_hints,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(
+            report, detail=detail, format=format)
+
+    def validate_expr(self, target: str,
+                      expression: str,
+                      inputs: list[str] | None = None,
+                      pattern_num: int = 512,
+                      validation_num: int = 2048,
+                      seed: int | None = 0,
+                      exhaustive: str = "auto",
+                      fixed_inputs: dict[str, int] | None = None,
+                      validate_scope: str = "support",
+                      detail: bool = False,
+                      format: str = "text") -> str:
+        """Validate an explicit expression hypothesis and cache it if accepted."""
+        expression, inputs = self._expand_candidate_refs(expression, inputs)
+        inputs = self._complete_expression_inputs(expression, inputs)
+        report = validate_expr_data(
+            self._current(), target, expression, inputs,
+            pattern_num=pattern_num,
+            validation_num=validation_num,
+            seed=seed,
+            exhaustive=exhaustive,
+            fixed_inputs=fixed_inputs,
+            validate_scope=validate_scope,
+            detail=detail,
+        )
+        report = self._cache_accepted_candidates(report)
+        self._ir_recorder.record_report(
+            "validate_expr",
+            {
+                "target": target,
+                "expression": expression,
+                "inputs": inputs,
+                "pattern_num": pattern_num,
+                "validation_num": validation_num,
+                "seed": seed,
+                "exhaustive": exhaustive,
+                "fixed_inputs": fixed_inputs,
+                "validate_scope": validate_scope,
+                "detail": detail,
+                "format": format,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(
+            report, detail=detail, format=format)
+
+    def combine_case_expr(self, target: str,
+                          controls: list[str],
+                          cases: list[dict],
+                          inputs: list[str] | None = None,
+                          pattern_num: int = 512,
+                          validation_num: int = 2048,
+                          seed: int | None = 0,
+                          exhaustive: str = "auto",
+                          detail: bool = False,
+                          format: str = "text") -> str:
+        """Combine branch expressions into a full conditional expression."""
+        expression, resolved_inputs = self._combine_case_expression(
+            controls, cases, inputs)
+        report = validate_expr_data(
+            self._current(), target, expression, resolved_inputs,
+            pattern_num=pattern_num,
+            validation_num=validation_num,
+            seed=seed,
+            exhaustive=exhaustive,
+            fixed_inputs=None,
+            validate_scope="support",
+            detail=detail,
+        )
+        report.notes = (
+            f"combined {len(cases)} branch expression(s) over controls: {', '.join(controls)}",
+            "case combination validates the full target and can be assembled if accepted",
+            *report.notes,
+        )
+        report = self._cache_accepted_candidates(report)
+        self._ir_recorder.record_report(
+            "combine_case_expr",
+            {
+                "target": target,
+                "controls": controls,
+                "cases": cases,
+                "inputs": inputs,
+                "pattern_num": pattern_num,
+                "validation_num": validation_num,
+                "seed": seed,
+                "exhaustive": exhaustive,
+                "detail": detail,
+                "format": format,
+                "combined_expression": expression,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(
+            report, detail=detail, format=format)
+
+    def infer_native_expr(self, target: str,
+                          inputs: list[str] | None = None,
+                          mode: str = "auto",
+                          max_cost: int | None = None,
+                          pattern_num: int = 512,
+                          validation_num: int = 2048,
+                          seed: int | None = 0,
+                          detail: bool = False,
+                          format: str = "text") -> str:
+        """Run native TABLE-I AST candidates for one target."""
+        net_to_node = build_net_to_node(self._current())
+        target_field = resolve_field(self._current(), target, net_to_node, role="target")
+        input_fields = resolve_inputs(self._current(), inputs, target_field, net_to_node)
+        support_bits = support_bit_count(input_fields)
+        if support_bits >= 32 and max_cost is None:
+            profile = get_tool_profile("infer_native_expr")
+            payload = {
+                "status": "deferred",
+                "reason": "native_search_support_too_wide",
+                "target": target,
+                "support_bits": support_bits,
+                "effort": profile.effort,
+                "search_space": profile.search_space,
+                "next_steps": [
+                    "split_control_cases",
+                    "validate_expr(..., fixed_inputs={...})",
+                    "combine_case_expr",
+                ],
+            }
+            self._ir_recorder.log_event(
+                "tool_deferred",
+                payload=payload,
+                tool="infer_native_expr",
+                target=target,
+                status="deferred")
+            if format == "json":
+                return json.dumps(payload, indent=2, sort_keys=True)
+            if format != "text":
+                raise ValueError("format must be 'text' or 'json'")
+            return "\n".join([
+                "Native expression inference deferred — support is too wide for default medium search.",
+                f"    target={target} support_bits={support_bits}",
+                f"    effort={profile.effort} search_space={profile.search_space} risk={profile.risk}",
+                "    Complex targets should be decomposed into control cases and explicit hypotheses.",
+                "    Next: split_control_cases -> validate_expr(..., fixed_inputs={...}) -> combine_case_expr.",
+                "    To intentionally bound this medium search, pass an explicit max_cost.",
+            ])
+        report = infer_native_expr_data(
+            self._current(), target, inputs,
+            mode=mode,
+            max_cost=max_cost,
+            pattern_num=pattern_num,
+            validation_num=validation_num,
+            seed=seed,
+            detail=detail,
+        )
+        report = self._cache_accepted_candidates(report)
+        self._ir_recorder.record_report(
+            "infer_native_expr",
+            {
+                "target": target,
+                "inputs": inputs,
+                "mode": mode,
+                "max_cost": max_cost,
+                "pattern_num": pattern_num,
+                "validation_num": validation_num,
+                "seed": seed,
+                "detail": detail,
+                "format": format,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(
+            report, detail=detail, format=format)
+
+    def check_polynomial_lowbits(self, target: str,
+                                 inputs: list[str] | None = None,
+                                 max_low_bits: int = 8,
+                                 detail: bool = False,
+                                 format: str = "text") -> str:
+        """Run bounded low-bit polynomial rewriting for one target."""
+        report = check_polynomial_lowbits_data(
+            self._current(), target, inputs,
+            max_low_bits=max_low_bits,
+            detail=detail,
+        )
+        report = self._cache_accepted_candidates(report)
+        self._ir_recorder.record_report(
+            "check_polynomial_lowbits",
+            {
+                "target": target,
+                "inputs": inputs,
+                "max_low_bits": max_low_bits,
+                "detail": detail,
+                "format": format,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(
+            report, detail=detail, format=format)
+
+    def split_control_cases(self, target: str,
+                            controls: list[str] | None = None,
+                            inputs: list[str] | None = None,
+                            pattern_num: int = 128,
+                            seed: int | None = 0,
+                            detail: bool = False) -> str:
+        """Inspect scalar control cases without composing expressions."""
+        self._analysis_seen = True
+        text = split_control_cases_data(
+            self._current(), target, controls, inputs,
+            pattern_num=pattern_num, seed=seed, detail=detail)
+        self._ir_recorder.record_tool_text(
+            "split_control_cases",
+            {
+                "target": target,
+                "controls": controls,
+                "inputs": inputs,
+                "pattern_num": pattern_num,
+                "seed": seed,
+                "detail": detail,
+            },
+            text,
+            target=target)
+        return text
+
+    def influence_profile(self, target: str,
+                          fixed_inputs: dict[str, int] | None = None,
+                          inputs: list[str] | None = None,
+                          base_inputs: dict[str, int] | None = None,
+                          pattern_num: int = 2,
+                          seed: int | None = 0,
+                          detail: bool = False) -> str:
+        """Perturb support bits under a fixed branch and report output deltas."""
+        self._analysis_seen = True
+        text = influence_profile_data(
+            self._current(), target, fixed_inputs, inputs,
+            base_inputs=base_inputs,
+            pattern_num=pattern_num,
+            seed=seed,
+            detail=detail,
+        )
+        self._ir_recorder.record_tool_text(
+            "influence_profile",
+            {
+                "target": target,
+                "fixed_inputs": fixed_inputs,
+                "inputs": inputs,
+                "base_inputs": base_inputs,
+                "pattern_num": pattern_num,
+                "seed": seed,
+                "detail": detail,
+            },
+            text,
+            target=target)
+        return text
+
+    def infer_pysr_expr(self, target: str,
+                        inputs: list[str] | None = None,
+                        force: bool = False,
+                        timeout_s: int = 30,
+                        niterations: int = 50,
+                        detail: bool = False,
+                        format: str = "text") -> str:
+        """Run PySR only when explicitly forced."""
+        if not force:
+            profile = get_tool_profile("infer_pysr_expr")
+            payload = {
+                "status": "deferred",
+                "reason": "pysr_requires_force",
+                "effort": profile.effort,
+                "search_space": profile.search_space,
+                "risk": profile.risk,
+                "next_step": (
+                    "Use probe_target, fit_template, or infer_native_expr "
+                    "on a narrowed target before infer_pysr_expr(force=True)."
+                ),
+            }
+            self._ir_recorder.log_event(
+                "tool_deferred",
+                payload=payload,
+                tool="infer_pysr_expr",
+                target=target,
+                status="deferred")
+            if format == "json":
+                return json.dumps(payload, indent=2, sort_keys=True)
+            if format != "text":
+                raise ValueError("format must be 'text' or 'json'")
+            return "\n".join([
+                "PySR inference deferred — force=True is required",
+                f"    effort={profile.effort} search_space={profile.search_space} risk={profile.risk}",
+                "    PySR is a heavy fallback, not a default recovery step.",
+                "    First narrow the target and try probe_target, fit_template, or infer_native_expr.",
+                "    To intentionally run it, call infer_pysr_expr(force=True).",
+            ])
+        report = infer_pysr_expr_data(
+            self._current(), target, inputs,
+            timeout_s=timeout_s,
+            niterations=niterations,
+            detail=detail,
+        )
+        report = self._cache_accepted_candidates(report)
+        self._ir_recorder.record_report(
+            "infer_pysr_expr",
+            {
+                "target": target,
+                "inputs": inputs,
+                "force": force,
+                "timeout_s": timeout_s,
+                "niterations": niterations,
+                "detail": detail,
+                "format": format,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(
+            report, detail=detail, format=format)
+
+    def assemble_rtl(self, candidates: list[str] | None = None,
+                     timeout_s: int = 300,
+                     detail: bool = False,
+                     format: str = "text") -> str:
+        """Assemble candidate RTL from accepted local candidates only."""
+        circuit = self._current()
+        analysis = _analyze_recovery_words(circuit)
+        unknown: list[str] = []
+        if candidates:
+            selected: list[ExpressionCandidate] = []
+            for cid in candidates:
+                cand = self._accepted_candidates.get(cid)
+                if cand is None:
+                    unknown.append(cid)
+                else:
+                    selected.append(cand)
+        else:
+            selected = list(self._accepted_candidates.values())
+        chosen: dict[str, ExpressionCandidate] = {}
+        for cand in selected:
+            if not cand.verification.accepted:
+                continue
+            target_word = cand.target.split("[", 1)[0]
+            current = chosen.get(target_word)
+            cand_key = (
+                0 if cand.verification.status.endswith("exact") else 1,
+                cand.cost,
+                cand.expression,
+            )
+            current_key = (
+                0 if current and current.verification.status.endswith("exact") else 1,
+                current.cost if current else 1_000_000,
+                current.expression if current else "",
+            )
+            if current is None or cand_key < current_key:
+                chosen[target_word] = cand
+        missing = [
+            word.name for word in analysis.output_words
+            if word.name not in chosen
+        ]
+        notes = [
+            "assemble_rtl consumes accepted local candidates only; it does not run expression recovery.",
+        ]
+        if unknown:
+            notes.append(f"unknown candidate id(s): {', '.join(unknown)}")
+        if missing:
+            report = RecoveryReport(
+                circuit_name=circuit.name,
+                word_analysis=analysis,
+                candidates=tuple(selected),
+                verification=VerificationResult(
+                    "not-run",
+                    "candidate RTL not emitted because accepted candidates are missing"),
+                unrecovered=tuple(missing),
+                notes=tuple(notes),
+            )
+            self._ir_recorder.record_report(
+                "assemble_rtl",
+                {
+                    "candidates": candidates,
+                    "timeout_s": timeout_s,
+                    "detail": detail,
+                    "format": format,
+                },
+                report,
+                circuit=self.circuit)
+            return format_recovery_report(report, detail=detail, format=format)
+
+        candidate_rtl = emit_candidate_rtl(circuit, chosen)
+        if self._source_code:
+            verification = self._verify_candidate_code(candidate_rtl, timeout_s)
+        else:
+            verification = VerificationResult(
+                "not-run", "no original Verilog source is available for CEC")
+        report = RecoveryReport(
+            circuit_name=circuit.name,
+            word_analysis=analysis,
+            candidates=tuple(selected),
+            candidate_rtl=candidate_rtl,
+            verification=verification,
+            notes=tuple(notes),
+        )
+        self._ir_recorder.record_report(
+            "assemble_rtl",
+            {
+                "candidates": candidates,
+                "timeout_s": timeout_s,
+                "detail": detail,
+                "format": format,
+            },
+            report,
+            circuit=self.circuit)
+        return format_recovery_report(report, detail=detail, format=format)
+
+    def recover_expression(self, target: str,
+                           inputs: list[str] | None = None,
+                           methods: str = "auto",
+                           control: bool = True,
+                           mode: str = "auto",
+                           max_cost: int | None = None,
+                           pattern_num: int = 4096,
+                           validation_num: int = 16384,
+                           seed: int | None = 0,
+                           timeout_s: int = 120,
+                           niterations: int = 200,
+                           detail: bool = False,
+                           format: str = "text") -> str:
+        """Deprecated guardrail for the old multi-method expression search."""
+        if format == "json":
+            return json.dumps({
+                "status": "deprecated",
+                "reason": "recover_expression_is_too_broad_for_agent_workflow",
+                    "next_steps": [
+                    "recovery_tool_guide",
+                    "probe_target",
+                    "validate_expr",
+                    "fit_template",
+                    "infer_native_expr",
+                    "check_polynomial_lowbits",
+                    "split_control_cases",
+                    "infer_pysr_expr(force=True) only as a fallback",
+                ],
+            }, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        return "\n".join([
+            "recover_expression is deprecated for agent-facing recovery.",
+            "    It no longer runs the broad multi-method search.",
+            "    Use probe_target first, then choose one narrow tool:",
+            "      - validate_expr when you already have a formula hypothesis",
+            "      - fit_template for linear/product/comparator hypotheses",
+            "      - infer_native_expr for native TABLE-I AST candidates",
+            "      - check_polynomial_lowbits for bounded polynomial evidence",
+            "      - split_control_cases for scalar control/mux behavior",
+            "      - infer_pysr_expr(force=True) only after narrowed failures",
+        ])
+
+    def recover_rtl(self, outputs: list[str] | None = None,
+                    timeout_s: int = 300,
+                    emit_unverified: bool = False,
+                    force: bool = False,
+                    pattern_num: int = 4096,
+                    validation_num: int = 16384,
+                    seed: int | None = 0,
+                    niterations: int = 200,
+                    detail: bool = False,
+                    format: str = "text") -> str:
+        """Deprecated full-module baseline; default path is assemble_rtl."""
+        if not force:
+            lines = [
+                "recover_rtl is deprecated for default agent-facing recovery.",
+                "    It no longer runs per-output expression recovery unless force=True is set.",
+                "    Use plan_recovery, then small tools per target, then assemble_rtl.",
+                "    To intentionally run the old heavy baseline, call recover_rtl(force=True).",
+            ]
+            if self._analysis_seen:
+                lines.append(
+                    "    NOTE: previous analysis is present; accepted candidates still need assemble_rtl.")
+            if format == "json":
+                return json.dumps({
+                    "status": "deferred",
+                    "reason": "recover_rtl_deprecated_without_force",
+                    "next_step": "plan_recovery(detail=True)",
+                    "assembly_step": "assemble_rtl()",
+                    "force_override": "recover_rtl(force=True)",
+                }, indent=2, sort_keys=True)
+            if format != "text":
+                raise ValueError("format must be 'text' or 'json'")
+            return "\n".join(lines)
+
+        verify = self._verify_candidate_code if self._source_code else None
+        report = recover_rtl_data(
+            self._current(),
+            outputs=outputs,
+            source_code=self._source_code,
+            verify_func=verify,
+            timeout_s=timeout_s,
+            emit_unverified=emit_unverified,
+            pattern_num=pattern_num,
+            validation_num=validation_num,
+            seed=seed,
+            niterations=niterations,
+            detail=detail,
+        )
+        return format_recovery_report(report, detail=detail, format=format)
 
     # -- simulation -----------------------------------------------------
 
@@ -961,7 +2181,85 @@ class CircuitSession:
 
     # -- ABC CEC ---------------------------------------------------------------
 
-    def _run_cec(self, old_code: str, new_code: str) -> dict:
+    def _candidate_port_guard(self, candidate_code: str) -> VerificationResult | None:
+        circuit = self._current()
+        expected = list(getattr(circuit, "module_ports", []) or [])
+        actual = _module_ports_from_code(_unescape(candidate_code))
+        if not expected or not actual:
+            return None
+        expected_set = set(expected)
+        actual_set = set(actual)
+        if expected_set != actual_set:
+            missing = sorted(expected_set - actual_set)
+            extra = sorted(actual_set - expected_set)
+            return VerificationResult(
+                "failed",
+                "port_mismatch: candidate top module ports do not match original "
+                f"(missing={missing or '[]'} extra={extra or '[]'})",
+            )
+        if expected != actual:
+            return VerificationResult(
+                "failed",
+                "port_order_mismatch: candidate top module port order differs from "
+                "the original; ABC/Yosys CEC maps ports by index here, so a "
+                "counterexample would be unreliable. "
+                f"expected={expected} actual={actual}",
+            )
+        return None
+
+    def _verify_candidate_code(self, candidate_code: str,
+                               timeout_s: int = 300) -> VerificationResult:
+        """Run CEC between the loaded Verilog source and candidate RTL."""
+        if not self._source_code:
+            return VerificationResult(
+                "not-run", "no original Verilog source is available for CEC")
+        port_guard = self._candidate_port_guard(candidate_code)
+        if port_guard is not None:
+            return port_guard
+        result = self._run_cec(
+            self._source_code, _unescape(candidate_code), timeout_s=timeout_s)
+        reason = result.get("reason", "unknown")
+        if result.get("success") and reason == "equivalent":
+            return VerificationResult(
+                "cec-proved", reason, result.get("elapsed", 0.0))
+        if result.get("success") and reason == "timeout_assumed_equivalent":
+            return VerificationResult(
+                "cec-timeout-assumed", reason, result.get("elapsed", 0.0))
+        return VerificationResult(
+            "failed", reason, result.get("elapsed", 0.0),
+            result.get("counterexample"))
+
+    def verify_rtl_candidate(self, candidate_code: str,
+                             timeout_s: int = 300,
+                             format: str = "text") -> str:
+        """Verify an externally supplied candidate RTL module against source."""
+        result = self._verify_candidate_code(candidate_code, timeout_s=timeout_s)
+        self._ir_recorder.log_event(
+            "rtl_verification",
+            payload={
+                "timeout_s": timeout_s,
+                "verification": result.to_dict(),
+                "candidate_preview": _unescape(candidate_code)[:2000],
+            },
+            tool="verify_rtl_candidate",
+            status=result.status)
+        self._ir_recorder.record_cex(result, source="verify_rtl_candidate")
+        if format == "json":
+            return json.dumps(result.to_dict(), indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        lines = [f"RTL candidate verification: {result.status}"]
+        if result.reason:
+            lines.append(f"    reason : {result.reason}")
+        if result.elapsed:
+            lines.append(f"    elapsed: {result.elapsed:.1f}s")
+        if result.counterexample:
+            lines.append("    counterexample:")
+            lines.append(json.dumps(result.counterexample, indent=2, sort_keys=True))
+        return "\n".join(lines)
+
+    def _run_cec(self, old_code: str, new_code: str,
+                 timeout_s: int = 310) -> dict:
         """Run ABC CEC via the ``abc_cec.py`` script.
 
         Returns ``{success, reason, output, counterexample?}`` compatible with
@@ -985,15 +2283,18 @@ class CircuitSession:
             )
             proc = subprocess.run(
                 ["python", abc_cec, old_path, new_path, "--json",
-                 "--timeout", "310"],
-                capture_output=True, text=True, timeout=320,
+                 "--timeout", str(timeout_s)],
+                capture_output=True, text=True, timeout=timeout_s + 10,
             )
             return json.loads(proc.stdout.strip())
         except subprocess.TimeoutExpired:
             return {
                 "success": True,
                 "reason": "timeout_assumed_equivalent",
-                "output": "ABC CEC timed out after 320s — assumed equivalent",
+                "output": (
+                    f"ABC CEC timed out after {timeout_s + 10}s — "
+                    "assumed equivalent"),
+                "elapsed": float(timeout_s + 10),
             }
         except json.JSONDecodeError:
             return {

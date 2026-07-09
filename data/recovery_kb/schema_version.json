@@ -1,0 +1,4 @@
+{
+  "schema_version": 2,
+  "description": "Curated GateSpy recovery experience graph. Ordinary runs write graph-only artifacts to .gate_spy/runs; explicit promotion appends verified relation/experience records to relations.jsonl and experiences.jsonl."
+}

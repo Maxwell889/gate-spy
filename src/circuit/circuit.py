@@ -61,6 +61,9 @@ class Circuit:
         # Primary I/O bit nets, in declaration order (MSB first within a bus).
         self.input_nets: list[str] = []
         self.output_nets: list[str] = []
+        # Top-level module ports exactly as listed in the Verilog header.
+        # AIGER inputs leave this empty and recovery falls back to I/O word order.
+        self.module_ports: list[str] = []
 
         self._next_id = 0
         self._driver: dict[str, int] = {}   # net -> node id that drives it
