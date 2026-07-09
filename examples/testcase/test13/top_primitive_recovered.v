@@ -3,19 +3,16 @@ module top(in1, in2, in3, in4, in5, in6, in7, in8, in9, in10, in11, in12, in13, 
   input in3, in4, in5, in6, in8, in9, in10, in11, in12, in13, in14, in15;
   output out1, out2, out3, out4, out5;
 
-  wire signed [12:0] a = in1;
-  wire signed [12:0] b = in2;
-  wire signed [12:0] c = in7;
-  wire signed [12:0] d = a - b;
-  wire signed [12:0] r = b - c;
+  wire signed [12:0] d = in1 - in2;
+  wire signed [12:0] r = in2 - in7;
   wire lt = d < r;
   wire gt = d > r;
-  wire slt = a < c;
-  wire sgt = a > c;
+  wire slt = in1 < in7;
+  wire sgt = in1 > in7;
 
-  assign out1 = in3 ? (in5 ? gt : sgt) : (in5 ? slt : lt);
-  assign out2 = in10 ? (in8 ? gt : sgt) : (in8 ? slt : lt);
-  assign out3 = in14 ? (in12 ? gt : sgt) : (in12 ? slt : lt);
-  assign out4 = b < c;
-  assign out5 = a < b;
+  assign out1 = in5 ? (in3 ? gt : slt) : (in3 ? sgt : lt);
+  assign out2 = in8 ? (in10 ? gt : slt) : (in10 ? sgt : lt);
+  assign out3 = in12 ? (in14 ? gt : slt) : (in14 ? sgt : lt);
+  assign out4 = r < 0;
+  assign out5 = d < 0;
 endmodule

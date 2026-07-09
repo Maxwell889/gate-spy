@@ -1,0 +1,30 @@
+module top(in1, in2, in3, in4, in5, in6, in7, in8, in9, in10, in11, in12, in13, in14, in15, in16, in17, in18, in19, in20, in21, in22, in23, in24, in25, out1);
+  input [15:0] in1;
+  input [15:0] in2;
+  input [15:0] in5;
+  input [15:0] in8;
+  input [15:0] in9;
+  input [15:0] in12;
+  input [15:0] in13;
+  input [15:0] in16;
+  input [15:0] in17;
+  input [15:0] in20;
+  input [15:0] in21;
+  input [15:0] in24;
+  input [15:0] in25;
+  input in3;
+  input in4;
+  input in6;
+  input in7;
+  input in10;
+  input in11;
+  input in14;
+  input in15;
+  input in18;
+  input in19;
+  input in22;
+  input in23;
+  output [31:0] out1;
+
+  assign out1 = in5 + (in3 ? 32'd0 : in1*in2) + (in6 ? 32'd0 : in8*in9) + (in10 ? 32'd0 : in12*in13) + (in14 ? 32'd0 : in16*in17) + (in18 ? 32'd0 : in20*in21) + (in22 ? 32'd0 : in24*in25);
+endmodule
