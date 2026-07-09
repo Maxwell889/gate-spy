@@ -455,7 +455,8 @@ def fit_template_data(circuit: Circuit, target_ref: str,
     notes.insert(1, f"restricted templates requested: {templates}")
     notes.insert(
         2,
-        "signed comparator and signed affine-difference comparator templates are included under comparator fitting")
+        "comparator fitting includes signed comparators, signed affine-difference comparators, "
+        "and bounded offset forms X_ext - Y_ext +/- CONST / X_ext CMP (Y_ext +/- CONST)")
     notes.append(f"sample_scope=full-support sample_bits={bit_count} variable_bits={variable_bit_count}")
     notes.append(f"support_inputs={_format_field_list(support_fields)}")
     notes.append(f"template_inputs={_format_field_list(candidate_fields)}")

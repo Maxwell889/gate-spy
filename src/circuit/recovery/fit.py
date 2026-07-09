@@ -108,6 +108,99 @@ def _threshold_candidates(fields: list[Field], samples: list[Sample],
     return out
 
 
+def _zero_extend(field: Field, width: int) -> Expr:
+    var = Var(field.label, field.width)
+    if width <= field.width:
+        return var
+    return Concat((Const(0, width - field.width), var))
+
+
+def _add_const(expr: Expr, value: int, width: int) -> Expr:
+    if value == 0:
+        return expr
+    if value > 0:
+        return Binary("+", expr, Const(value, width))
+    return Binary("-", expr, Const(-value, width))
+
+
+def _apply_modular_delta(expr: Expr, delta: int, width: int) -> Expr:
+    modulus = 1 << width
+    delta &= modulus - 1
+    if delta == 0:
+        return expr
+    half = 1 << (width - 1)
+    if delta >= half:
+        return Binary("-", expr, Const(modulus - delta, width))
+    return Binary("+", expr, Const(delta, width))
+
+
+def _small_offsets(width: int) -> list[int]:
+    offsets: list[int] = []
+    seen: set[int] = set()
+
+    def add(value: int) -> None:
+        if value in seen:
+            return
+        offsets.append(value)
+        seen.add(value)
+
+    for value in range(-32, 33):
+        add(value)
+    for bit in range(min(width, 16)):
+        base = 1 << bit
+        for delta in (-2, -1, 0, 1, 2):
+            add(base + delta)
+            add(-(base + delta))
+    return offsets
+
+
+def _offset_subtract_candidates(fields: list[Field], samples: list[Sample],
+                                width: int) -> list[Expr]:
+    """Fit ``X_ext - Y_ext +/- CONST`` from a sample-derived modular delta."""
+    if width <= 1 or len(fields) < 2:
+        return []
+    out: list[Expr] = []
+    for left, right in permutations(fields, 2):
+        lhs = _zero_extend(left, width)
+        rhs = _zero_extend(right, width)
+        base = Binary("-", lhs, rhs)
+        deltas: set[int] = set()
+        for sample in samples:
+            try:
+                base_value = base.evaluate(sample.env).unsigned & mask(width)
+            except Exception:
+                deltas = set()
+                break
+            deltas.add((sample.target.unsigned - base_value) & mask(width))
+            if len(deltas) > 1:
+                break
+        if len(deltas) != 1:
+            continue
+        expr = _apply_modular_delta(base, next(iter(deltas)), width)
+        if _eval_expr(expr, samples, width):
+            out.append(expr)
+    return out
+
+
+def _offset_comparator_candidates(fields: list[Field], samples: list[Sample],
+                                  width: int) -> list[Expr]:
+    """Fit ``X_ext CMP (Y_ext +/- CONST)`` with a bounded constant scan."""
+    if width != 1 or len(fields) < 2:
+        return []
+    out: list[Expr] = []
+    for left, right in permutations(fields, 2):
+        cmp_width = max(left.width, right.width) + 1
+        lhs = _zero_extend(left, cmp_width)
+        rhs_base = _zero_extend(right, cmp_width)
+        for offset in _small_offsets(cmp_width):
+            rhs = _add_const(rhs_base, offset, cmp_width)
+            for op in (">=", ">", "<=", "<"):
+                expr = Binary(op, lhs, rhs)
+                if _eval_expr(expr, samples, width):
+                    out.append(expr)
+    return out
+
+
 def _signed_var(field: Field) -> Expr:
     return Cast(True, Var(field.label, field.width))
 
@@ -185,6 +278,10 @@ def fitting_candidates(input_fields: list[Field], target_width: int,
 
     for expr in _threshold_candidates(input_fields, samples, target_width):
         add(expr, "comparator-boundary-fitting")
+    for expr in _offset_subtract_candidates(input_fields, samples, target_width):
+        add(expr, "offset-subtract-template-fitting")
+    for expr in _offset_comparator_candidates(input_fields, samples, target_width):
+        add(expr, "offset-comparator-template-fitting")
     for expr in _signed_comparator_candidates(input_fields, samples, target_width):
         add(expr, "signed-comparator-template-fitting")
     for expr in _signed_affine_difference_candidates(input_fields, samples, target_width):

@@ -484,7 +484,119 @@ def _record_tokens(record: dict[str, Any]) -> set[str]:
     tokens.update(str(tok).lower() for tok in features.get("tokens", []) if tok)
     for key in ("target", "relation", "trigger", "suggested_experiment", "summary", "kind"):
         tokens.update(_tokens_from_text(str(record.get(key, ""))))
+    template_family = record.get("template_family")
+    if isinstance(template_family, dict):
+        tokens.update(_tokens_from_text(json.dumps(
+            template_family, sort_keys=True, default=_json_default)))
     return tokens
+
+
+def _validation_expression(validation: dict[str, Any] | None) -> str:
+    if not validation:
+        return ""
+    data = validation.get("data")
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("expression", ""))
+
+
+def _relation_expression(relation: dict[str, Any],
+                         validation: dict[str, Any] | None) -> str:
+    data = relation.get("data") if isinstance(relation.get("data"), dict) else {}
+    return str(data.get("expression") or _validation_expression(validation))
+
+
+def _operator_family_tokens(expression: str) -> list[str]:
+    tokens = set(_tokens_from_text(expression))
+    operators: list[str] = []
+    if any(op in tokens for op in ("<", "<=", ">", ">=", "==", "!=")):
+        operators.append("compare")
+    if "+" in tokens:
+        operators.append("add")
+    if "-" in tokens:
+        operators.append("subtract")
+    if "*" in tokens:
+        operators.append("multiply")
+    if "signed" in expression.lower():
+        operators.append("signed")
+    if "{" in expression and "}" in expression:
+        operators.append("extend-or-concat")
+    if re.search(r"\d+'[sdhboSDHBO]\d+", expression):
+        operators.append("literal-constant")
+    return operators
+
+
+def _induce_template_family(relation: dict[str, Any],
+                            validation: dict[str, Any] | None,
+                            *,
+                            negative: bool = False) -> dict[str, Any]:
+    """Infer a reusable template family from a verified relation path.
+
+    This deliberately records placeholders and experiments, not answer formulas.
+    """
+    data = relation.get("data") if isinstance(relation.get("data"), dict) else {}
+    relation_text = str(data.get("relation") or relation.get("summary", ""))
+    suggested = str(data.get("suggested_experiment", ""))
+    expression = _relation_expression(relation, validation)
+    haystack = f"{relation_text}\n{suggested}\n{expression}".lower()
+    operators = _operator_family_tokens(expression)
+
+    if negative:
+        family = "negative_path"
+        template = "avoid repeating disproved hypothesis family"
+        experiment = suggested or "make a smaller directed experiment before trying another global candidate"
+    elif "predecessor" in haystack or "successor" in haystack:
+        family = "successor_equality"
+        template = "(X_ext +/- 1) == Y"
+        experiment = suggested or "enumerate edge rows around zero/max, then validate predecessor/successor equality"
+    elif re.search(r"[<>]=?|==|!=", expression) and re.search(r"[+-]\s*\d+'[sdhbo]\d+", haystack):
+        family = "offset_comparator"
+        template = "X_ext CMP (Y_ext +/- CONST)"
+        experiment = suggested or (
+            "scan bounded small constants around two word operands, then full-support "
+            "validate the comparator relation")
+    elif re.search(r"\-\s*[^<>=]+[+-]\s*\d+'[sdhbo]\d+", haystack):
+        family = "offset_subtract"
+        template = "X_ext - Y_ext +/- CONST"
+        experiment = suggested or (
+            "derive the modular delta between target and X_ext - Y_ext from samples, "
+            "then full-support validate")
+    elif "affine" in haystack and "signed" in haystack:
+        family = "signed_affine_comparator"
+        template = "signed(X)-signed(Y) CMP signed(Y)-signed(Z)"
+        experiment = suggested or "validate signed affine-difference comparators under full-support scope"
+    elif "sum" in haystack and "+" in expression:
+        family = "unsigned_sum"
+        template = "X + Y [+ Z ...]"
+        experiment = suggested or "validate a full-support word sum before escalating to search"
+    else:
+        clean_relation = re.sub(r"\s+", "_", relation_text.strip().lower())[:48]
+        family = f"relation:{clean_relation or 'generic'}"
+        template = "verified relation family; derive a parameterized variant before reuse"
+        experiment = suggested or "make a directed experiment, induce a relation, then full-support validate it"
+
+    return {
+        "family": family,
+        "template": template,
+        "operators": operators,
+        "suggested_experiment": experiment,
+        "source": "induced_from_reasoning_graph",
+    }
+
+
+def _features_with_template_family(features: dict[str, Any],
+                                   template_family: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(features or {})
+    tokens = set(str(tok).lower() for tok in merged.get("tokens", []) if tok)
+    family = str(template_family.get("family", ""))
+    if family:
+        tokens.add(f"family:{family.lower()}")
+        tokens.update(_tokens_from_text(family))
+    tokens.update(_tokens_from_text(str(template_family.get("template", ""))))
+    tokens.update(_tokens_from_text(str(template_family.get("suggested_experiment", ""))))
+    tokens.update(str(op).lower() for op in template_family.get("operators", []) if op)
+    merged["tokens"] = sorted(tokens)
+    return merged
 
 
 class LocalRecoveryKB:
@@ -536,6 +648,7 @@ class LocalRecoveryKB:
                     "relation": record.get("relation", ""),
                     "trigger": record.get("trigger", ""),
                     "suggested_experiment": record.get("suggested_experiment", ""),
+                    "template_family": record.get("template_family", {}),
                     "validation": record.get("validation", {}),
                     "summary": record.get("summary", ""),
                     "provenance": record.get("provenance", {}),
@@ -599,10 +712,17 @@ class LocalRecoveryKB:
             experience_records.append(self._experience_record(
                 run_data, problem, None, negative=True))
 
+        family_names = {
+            str(record.get("template_family", {}).get("family", ""))
+            for record in relation_records + experience_records
+            if isinstance(record.get("template_family"), dict)
+            and record.get("template_family", {}).get("family")
+        }
         result = {
             "dry_run": dry_run,
             "run": str(run_path),
             "templates": 0,
+            "template_families": len(family_names),
             "failures": sum(1 for record in experience_records if record.get("negative")),
             "relations": len(relation_records),
             "experiences": len(experience_records),
@@ -614,21 +734,35 @@ class LocalRecoveryKB:
         self.kb_dir.mkdir(parents=True, exist_ok=True)
         existing_relations = self._existing_ids(self.relation_path)
         existing_experiences = self._existing_ids(self.experience_path)
-        written = {"relations": 0, "experiences": 0, "templates": 0, "failures": 0}
+        written_family_names: set[str] = set()
+        written = {
+            "relations": 0,
+            "experiences": 0,
+            "templates": 0,
+            "template_families": 0,
+            "failures": 0,
+        }
         for record in relation_records:
             if record["knowledge_id"] in existing_relations:
                 continue
             _append_jsonl(self.relation_path, record)
             existing_relations.add(record["knowledge_id"])
             written["relations"] += 1
+            family = record.get("template_family", {}).get("family", "")
+            if family:
+                written_family_names.add(str(family))
         for record in experience_records:
             if record["knowledge_id"] in existing_experiences:
                 continue
             _append_jsonl(self.experience_path, record)
             existing_experiences.add(record["knowledge_id"])
             written["experiences"] += 1
+            family = record.get("template_family", {}).get("family", "")
+            if family:
+                written_family_names.add(str(family))
             if record.get("negative"):
                 written["failures"] += 1
+        written["template_families"] = len(written_family_names)
         result["written"] = written
         return result
 
@@ -660,7 +794,11 @@ class LocalRecoveryKB:
             "source_node_id": relation.get("node_id", ""),
         }
         knowledge_id = _stable_hash(payload, length=24)
-        features = relation.get("features") or {}
+        template_family = _induce_template_family(relation, validation)
+        features = _features_with_template_family(
+            relation.get("features") or {},
+            template_family,
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "knowledge_id": knowledge_id,
@@ -669,6 +807,7 @@ class LocalRecoveryKB:
             "relation": relation.get("data", {}).get("relation", relation.get("summary", "")),
             "trigger": relation.get("data", {}).get("trigger", ""),
             "suggested_experiment": relation.get("data", {}).get("suggested_experiment", ""),
+            "template_family": template_family,
             "validation": validation.get("data", {}),
             "summary": relation.get("summary", ""),
             "negative": False,
@@ -696,9 +835,12 @@ class LocalRecoveryKB:
             "source_node_id": source.get("node_id", ""),
         }
         knowledge_id = _stable_hash(payload, length=24)
+        template_family = _induce_template_family(
+            source, validation, negative=negative)
         features = source.get("features") or recovery_feature_tokens(
             target=str(source.get("target", "")),
             extra={"relation": relation, "trigger": trigger, "suggested_experiment": suggested})
+        features = _features_with_template_family(features, template_family)
         summary = source.get("summary", "")
         if negative and not summary:
             summary = "negative experience"
@@ -710,6 +852,7 @@ class LocalRecoveryKB:
             "relation": relation,
             "trigger": trigger,
             "suggested_experiment": suggested,
+            "template_family": template_family,
             "validation": validation.get("data", {}) if validation else {},
             "summary": summary,
             "negative": negative,

@@ -53,6 +53,12 @@ Durable learning follows this fixed loop:
 failure -> small experiment -> observation -> relation -> full-support validation/CEC -> experience
 ```
 
+Reusable templates should emerge from this loop. If a newly validated relation
+looks reusable, record it as a relation with the trigger, suggested experiment,
+and expression, then promote it. Promotion induces a parameterized
+`template_family` for later RAG retrieval; it should teach future agents what
+experiment to try, not hand them an accepted formula.
+
 Ordinary tool logs are not knowledge and are not persisted. A useful recovery
 trace records what problem was encountered, what experiment was run, what
 relationship was inferred, and how it was validated. If a failure does not lead
@@ -117,8 +123,10 @@ Use small tools, one hypothesis at a time:
    `fixed_inputs={"ctrl": value}`. Branch-conditioned full-support candidates
    are evidence only; combine cases before final `assemble_rtl`.
 3. `fit_template(target, inputs=None, templates="linear,product,comparator")`
-   for restricted arithmetic/comparator hypotheses, including signed word
-   comparators and signed affine-difference comparators such as
+   for restricted arithmetic/comparator hypotheses, including bounded offset
+   arithmetic/comparators (`X_ext - Y_ext +/- CONST`,
+   `X_ext CMP (Y_ext +/- CONST)`), signed word comparators, and signed
+   affine-difference comparators such as
    `($signed({a[msb], a}) - $signed({b[msb], b})) <
    ($signed({b[msb], b}) - $signed({c[msb], c}))`. For a branch-local template
    attempt, pass `fixed_inputs` for the full control assignment; the tool
@@ -163,7 +171,23 @@ Use small tools, one hypothesis at a time:
    nonzero `base_inputs` before removing a support word.
 12. `verify_rtl_candidate(candidate_code, timeout_s=300)` when you manually
    assemble or edit a candidate RTL module.
-13. `record_recovery_graph_node(node_type, target, summary, data=None,
+13. `analyze_rtl_cost(candidate_code="", path="", top_n=10)` after a full RTL
+   candidate is equivalent or nearly ready. It reports cost hotspots,
+   duplicate RHS expressions, declaration-initializer costs, repeated sign/zero
+   extensions, concat bit-patterns, output/predicate relation opportunities,
+   and rewrite family hints. It does not run CEC and does not accept
+   candidates.
+14. `propose_rtl_rewrites(candidate_code="", path="", strategies="all")` to
+   generate bounded local optimization candidates such as exact CSE, extension
+   hoisting, concat-to-affine / narrow modular-subtract /
+   conditional-subtract fitting, signed-alias collapse, output-relation
+   predicate factoring, and mux-plus-common-add factoring. These candidates are
+   untrusted until CEC.
+15. `optimize_rtl_round(candidate_code="", path="", timeout_s=60)` for one
+   cost-guided rewrite round. It computes cost for each proposed candidate and
+   runs short CEC only on lower-cost candidates. Use `format=json` to retrieve
+   best candidate code, then run final `verify_rtl_candidate(timeout_s=300)`.
+16. `record_recovery_graph_node(node_type, target, summary, data=None,
    links=None, promotable=False)` whenever a failure, experiment, observation,
    inferred relation, or validation result should be durable. Use node types
    `problem`, `experiment`, `observation`, `relation`, `validation`, and
@@ -171,17 +195,22 @@ Use small tools, one hypothesis at a time:
    text, full transcripts, or bit-level patterns. `record_recovery_note(...)`
    remains a compatibility helper for small observations, but the graph-node
    tool is preferred because it forces the reasoning role.
-14. `query_recovery_experience(...)` retrieves promoted experience graph records:
-   triggers, suggested small experiments, relation families, validation source,
-   and negative stop rules. It never returns an accepted candidate.
-15. `export_recovery_ir()` to inspect the graph-only snapshot when debugging
+17. `query_recovery_experience(...)` retrieves promoted experience graph records:
+   triggers, suggested small experiments, induced `template_family` records,
+   relation families, validation source, and negative stop rules. It never
+   returns an accepted candidate or a case answer. Treat hits as prompts for
+   the next small experiment, such as "scan offset comparator constants", then
+   validate your derived hypothesis normally.
+18. `export_recovery_ir()` to inspect the graph-only snapshot when debugging
    failure or preparing a reproducible report. Despite the compatibility name,
    this is not a raw tool trace.
-16. `promote_recovery_experience(run_id=None, dry_run=True)` only after reviewing
+19. `promote_recovery_experience(run_id=None, dry_run=True)` only after reviewing
    the graph. Positive promotion requires a verified `relation -> validation`
-   chain. `expr_only`, ordinary tool output, failed candidates, and unverified
-   observations cannot become positive experience; selected/promotable problems
-   may become negative experience.
+   chain. During promotion GateSpy induces a parameterized template family from
+   the verified relation (for example `X_ext CMP (Y_ext +/- CONST)`), not a
+   reusable answer formula. `expr_only`, ordinary tool output, failed
+   candidates, and unverified observations cannot become positive experience;
+   selected/promotable problems may become negative experience.
 
 Do not use `verify_rtl_candidate` or `edit` as a formula brute-force loop. If
 two nearby whole-module candidates produce CEXs, stop, summarize the shared
@@ -370,6 +399,20 @@ python scripts/cost.py <candidate.v> --debug
 python scripts/yosys_cec.py <original.v> <candidate.v> --timeout 60
 ```
 
+Prefer the MCP optimization tools over unaided guessing:
+
+```text
+analyze_rtl_cost -> propose_rtl_rewrites or optimize_rtl_round(timeout_s=60)
+-> inspect accepted lower-cost candidates -> final verify_rtl_candidate(timeout_s=300)
+```
+
+`analyze_rtl_cost` identifies the current cost drivers. `optimize_rtl_round`
+is the default one-round optimizer because it combines bounded rewrite
+generation, cost measurement, and short CEC. Use manual temporary scripts only
+when the tool output shows a rewrite family worth exploring but not yet
+implemented. If a manual rewrite succeeds repeatedly, promote it as an
+optimization experience and consider adding it to the optimizer.
+
 When using a generated or temporary candidate, write it under
 `/private/tmp/gate-spy-opt-*/` and keep only the final useful artifact in the
 repo. If `yosys_cec.py` is unavailable or inconclusive, use `abc_cec.py` or the
@@ -386,8 +429,9 @@ result until the final selected candidate is checked with the long timeout.
 
 Each optimization round should do all of the following:
 
-1. Inspect the current best RTL and cost drivers. Use `scripts/cost.py --debug`,
-   direct reading, and small scripts when needed. It is acceptable to use
+1. Inspect the current best RTL and cost drivers. Start with
+   `analyze_rtl_cost`; use `scripts/cost.py --debug`, direct reading, and small
+   scripts only when the MCP analysis is insufficient. It is acceptable to use
    "stare at the RTL" reasoning, but convert every promising idea into a
    reproducible candidate file or tool call.
 2. Propose one to three concrete transformations. Prefer local transformations
@@ -403,9 +447,13 @@ Each optimization round should do all of the following:
    - choosing `case` versus nested `?:` based on the cost table, not style,
    - pushing sign extension, bit selection, or negation into an already needed
      arithmetic expression when CEC confirms it,
+   - using explicit narrow intermediate wires to preserve modular wrap before
+     zero/sign extension when a concat bit pattern encodes a small arithmetic
+     table,
    - rewriting output families together rather than optimizing each output in
      isolation.
-3. For each candidate, compute cost and run the round CEC check with
+3. Prefer `optimize_rtl_round(timeout_s=60)` for the candidate batch. For each
+   manual candidate, compute cost and run the round CEC check with
    `round_cec_timeout_s=60` before accepting it for the loop.
 4. Accept the candidate for the optimization loop only if the round CEC is
    `cec-proved` or `cec-timeout-assumed` and cost is lower than `best_cost`.
@@ -421,8 +469,6 @@ Stop the optimization loop only when one of these is true:
 - `no_improve_rounds >= 3` after three consecutive non-improving rounds.
 - A strict user budget or timeout is reached.
 - CEC tooling is unavailable and no trustworthy equivalence check can be run.
-- The current cost already matches a known target cost and an extra round finds
-  no improvement.
 
 Do not count an untested idea as a round. A round must include at least one
 concrete candidate with cost and CEC results, or a small script that proves no
@@ -537,7 +583,8 @@ $$\text{reduction rate} = \left(1 - \frac{\text{cost}}{\text{gate count}}\right)
 - **Revert if stuck.**  `revert(help=true)` shows history; roll back bad edits and try another path.
 - **Optimize until the stop rule.**  Before dumping, run the multi-round
   optimization loop. Do not stop after the first equivalent RTL. Stop only after
-  three consecutive non-improving rounds, a user budget/tooling limit, or a
-  known target cost plus one non-improving confirmation round.
+  three consecutive non-improving rounds, a user budget/tooling limit, or
+  unavailable equivalence checking. External comparison baselines are not stop
+  conditions and must not cap the search.
 - **Trust CEC over manual simulation.**  Once you have a rough hypothesis, `edit` it directly rather than exhaustively simulating corner cases.  Rejected edits return precise counterexamples that pinpoint the flaw — iterate on those instead of guessing patterns from random input vectors.
 - **Declare signed wires instead of using `$signed()`.**  When a comparison needs signed semantics, declare intermediate wires as `wire signed [W-1:0]` and compare them directly.  Verilog then uses implicit signed comparison, and the cost function counts only the real arithmetic operators.

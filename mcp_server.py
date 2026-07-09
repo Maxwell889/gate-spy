@@ -320,11 +320,11 @@ def query_recovery_experience(target: str = "",
     """Query promoted recovery experience graph records.
 
     Retrieval is deterministic local RAG over graph-derived experience:
-    triggering conditions, suggested small experiments, relation families,
-    validation source, and negative stop rules.  It intentionally does not
-    return an accepted candidate formula.  A hit can only guide the next
-    experiment; it cannot enter the candidate cache or final RTL without normal
-    full-support validation or CEC.
+    triggering conditions, suggested small experiments, induced template
+    families, relation families, validation source, and negative stop rules.
+    It intentionally does not return an accepted candidate formula.  A hit can
+    only guide the next experiment; it cannot enter the candidate cache or
+    final RTL without normal full-support validation or CEC.
     """
     return session.query_recovery_experience(target, inputs, features, limit, format)
 
@@ -338,8 +338,9 @@ def query_recovery_memory(target: str = "",
     """Compatibility alias for ``query_recovery_experience``.
 
     Existing prompts may still call this name.  The implementation now queries
-    graph experience, not answer templates.  Hits suggest what experiment to run
-    or what failed path to avoid; they never create accepted candidates.
+    graph experience and induced template families, not answer templates.  Hits
+    suggest what experiment to run or what failed path to avoid; they never
+    create accepted candidates.
     """
     return session.query_recovery_memory(target, inputs, features, limit, format)
 
@@ -353,7 +354,10 @@ def promote_recovery_experience(run_id: str = "",
     """Promote verified reasoning graph paths into ``data/recovery_kb``.
 
     Positive promotion requires a ``relation`` node linked to, or matching, an
-    accepted ``validation`` node from full-support validation or CEC.  ``expr_only`` evidence,
+    accepted ``validation`` node from full-support validation or CEC.  During
+    promotion GateSpy induces a parameterized ``template_family`` from the
+    verified relation, for example ``X_ext CMP (Y_ext +/- CONST)``; it does not
+    promote the concrete answer formula as an accepted candidate.  ``expr_only`` evidence,
     unverified notes, ordinary tool output, and failed candidates are
     never positive experience.  Problem nodes may be promoted as negative
     experience only when explicitly selected or marked promotable.
@@ -454,11 +458,13 @@ def fit_template(target: str,
                  format: str = "text") -> str:
     """Fit only restricted templates for one target.
 
-    This runs linear/product/comparator template fitting plus signed comparator
-    and signed affine-difference comparator variants, then GateSpy bit-vector
-    validation.  It does not run PySR, polynomial rewriting, or control
-    enumeration.  Accepted global candidates are stored in the session with ids
-    for later ``assemble_rtl``.
+    This runs linear/product/comparator template fitting plus signed comparator,
+    signed affine-difference comparator, bounded offset subtract, and bounded
+    offset comparator variants such as ``X_ext - Y_ext +/- CONST`` and
+    ``X_ext CMP (Y_ext +/- CONST)``.  The bounded offset comparator family is
+    still only accepted after GateSpy bit-vector validation.  It does not run
+    PySR, polynomial rewriting, or control enumeration.  Accepted global
+    candidates are stored in the session with ids for later ``assemble_rtl``.
 
     For branch-local fitting, pass ``fixed_inputs={...}`` with every scalar
     control in that branch.  Candidate expressions are generated from ``inputs``
@@ -758,6 +764,75 @@ def verify_rtl_candidate(candidate_code: str,
     ``plan_recovery(feedback=...)``.
     """
     return session.verify_rtl_candidate(candidate_code, timeout_s, format)
+
+
+@mcp.tool()
+def analyze_rtl_cost(candidate_code: str = "",
+                     path: str = "",
+                     top_n: int = 10,
+                     format: str = "text") -> str:
+    """Analyze ICCAD cost hotspots in a complete RTL candidate.
+
+    Use this after recovery has produced functionally equivalent RTL, or when
+    inspecting an existing recovered RTL file.  It reports total cost,
+    per-assignment and declaration-initializer hotspots, repeated RHS
+    expressions, repeated sign/zero extension fragments, concat bit-patterns,
+    output/predicate relation opportunities, signed-alias collapse
+    opportunities, and rewrite-family hints.  It does not change code, does
+    not run CEC, and does not produce accepted candidates.
+
+    Provide either ``candidate_code`` or ``path``.  If both are empty, the
+    current loaded Verilog/edit state is analyzed.
+    """
+    return session.analyze_rtl_cost(candidate_code, path, top_n, format)
+
+
+@mcp.tool()
+def propose_rtl_rewrites(candidate_code: str = "",
+                         path: str = "",
+                         strategies: str = "all",
+                         max_candidates: int = 8,
+                         format: str = "text") -> str:
+    """Generate bounded cost-guided RTL rewrite candidates.
+
+    This is an optimization-stage tool, not a semantic recovery tool.  It
+    proposes local rewrite candidates from a CEC-proved or candidate RTL using
+    families such as exact common-subexpression extraction, repeated
+    sign/zero-extension hoisting, concat-to-affine, narrow modular-subtract, or
+    conditional-subtract fitting, signed-alias collapse, output-relation
+    predicate factoring, and mux-plus-common-add factoring.  The returned
+    proposals are untrusted until ``optimize_rtl_round`` or
+    ``verify_rtl_candidate`` proves them equivalent.
+
+    Use ``format=json`` to retrieve candidate code for a selected rewrite.
+    """
+    return session.propose_rtl_rewrites(
+        candidate_code, path, strategies, max_candidates, format)
+
+
+@mcp.tool()
+def optimize_rtl_round(candidate_code: str = "",
+                       path: str = "",
+                       strategies: str = "all",
+                       max_candidates: int = 8,
+                       timeout_s: int = 60,
+                       accept_timeout: bool = True,
+                       format: str = "text") -> str:
+    """Run one cost-guided RTL optimization round.
+
+    The tool generates a bounded batch of rewrite candidates, computes ICCAD
+    cost for each one, and runs ABC CEC only on candidates whose cost is lower
+    than the starting RTL.  Per-round ``timeout_s`` should normally be 60; the
+    final chosen candidate should still be checked with
+    ``verify_rtl_candidate(timeout_s=300)`` before reporting it as final.
+
+    Accepted results are optimization candidates only.  Record failed rewrite
+    families as negative experience when useful; do not use this tool to mutate
+    formulas for unrecovered outputs.
+    """
+    return session.optimize_rtl_round(
+        candidate_code, path, strategies, max_candidates,
+        timeout_s, accept_timeout, format)
 
 
 @mcp.tool()

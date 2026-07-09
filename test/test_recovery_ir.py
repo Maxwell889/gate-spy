@@ -183,6 +183,59 @@ def test_experience_promotion_and_query_return_experiment_provenance(tmp_path: P
     assert all(hit["provenance"] for hit in hits)
 
 
+def test_experience_promotion_induces_offset_template_family(tmp_path: Path):
+    session = _session_with_tmp_memory(tmp_path)
+    session.load(
+        "examples/testcase/test17/top_primitive.v",
+        record_ir=True,
+        case_id="test17",
+        out_dir=str(tmp_path / "runs"),
+    )
+    session.record_recovery_graph_node(
+        "relation",
+        target="out2",
+        summary="offset comparator from boundary rows",
+        data={
+            "relation": "zero-extended offset comparator",
+            "trigger": "directed samples show in2 boundary is in1 plus a constant",
+            "suggested_experiment": "scan small offset constants and validate full-support comparator",
+            "expression": "{1'd0, in2} >= ({2'd0, in1} + 33'd10)",
+        },
+    )
+    accepted = session.validate_expr(
+        "out2",
+        "{1'b0, in2} >= ({2'b0, in1} + 33'd10)",
+        inputs=["in1", "in2"],
+        exhaustive="never",
+        pattern_num=64,
+        validation_num=128,
+    )
+    assert "sample-exact" in accepted
+
+    write = json.loads(
+        session.promote_recovery_experience(dry_run=False, format="json"))
+    assert write["template_families"] == 1
+    assert write["written"]["template_families"] == 1
+
+    hits = json.loads(session.query_recovery_experience(
+        target="out2",
+        inputs=["in1", "in2"],
+        limit=5,
+        format="json",
+    ))
+    assert hits
+    assert all(hit["expression"] == "" for hit in hits)
+    families = [
+        hit.get("template_family", {}).get("family")
+        for hit in hits
+    ]
+    assert "offset_comparator" in families
+    assert any(
+        "scan" in hit.get("suggested_experiment", "")
+        for hit in hits
+    )
+
+
 def test_test16_reasoning_graph_successor_experience(tmp_path: Path):
     session = _session_with_tmp_memory(tmp_path)
     session.load(

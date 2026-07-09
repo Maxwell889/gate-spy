@@ -41,6 +41,10 @@ from .circuit.recovery import (
     validate_expr_data,
 )
 from .circuit.recovery.pipeline import emit_candidate_rtl
+from .circuit.recovery.rtl_opt import (
+    analyze_rtl_cost as analyze_rtl_cost_data,
+    propose_rtl_rewrites as propose_rtl_rewrites_data,
+)
 from .circuit.symbolic.parser import expression_identifiers
 from .circuit.symbolic.resolver import build_net_to_node, resolve_field, resolve_inputs
 from .circuit.symbolic.sampler import support_bit_count
@@ -659,6 +663,7 @@ class CircuitSession:
             f"    run       : {result.get('run')}",
             f"    relations : {result.get('relations', 0)}",
             f"    experience: {result.get('experiences', 0)}",
+            f"    families  : {result.get('template_families', 0)}",
             f"    negative  : {result.get('failures', 0)}",
         ]
         if result.get("written"):
@@ -720,6 +725,12 @@ class CircuitSession:
                 lines.append(f"      trigger={hit.get('trigger')}")
             if hit.get("suggested_experiment"):
                 lines.append(f"      experiment={hit.get('suggested_experiment')}")
+            family = hit.get("template_family") or {}
+            if isinstance(family, dict) and family:
+                if family.get("family"):
+                    lines.append(f"      template_family={family.get('family')}")
+                if family.get("template"):
+                    lines.append(f"      template={family.get('template')}")
             validation = hit.get("validation") or hit.get("verification")
             if validation:
                 if isinstance(validation, dict):
@@ -760,9 +771,13 @@ class CircuitSession:
         for hit in hits[:3]:
             label = "negative-experience" if hit.get("negative") else "experience"
             relation = hit.get("relation") or hit.get("summary") or hit.get("target")
+            family = ""
+            template_family = hit.get("template_family") or {}
+            if isinstance(template_family, dict) and template_family.get("family"):
+                family = f" family={template_family['family']}"
             notes.append(
                 f"memory {label} hit score={hit.get('score')}: "
-                f"{relation}")
+                f"{relation}{family}")
         report.notes = tuple(notes)
         return report
 
@@ -2256,6 +2271,210 @@ class CircuitSession:
         if result.counterexample:
             lines.append("    counterexample:")
             lines.append(json.dumps(result.counterexample, indent=2, sort_keys=True))
+        return "\n".join(lines)
+
+    def _rtl_code_from_input(self, candidate_code: str = "",
+                             path: str = "") -> str:
+        if candidate_code:
+            return _unescape(candidate_code)
+        if path:
+            return Path(path).read_text(encoding="utf-8")
+        if self._current_code:
+            return self._current_code
+        if self._source_code:
+            return self._source_code
+        raise ValueError("provide candidate_code or path, or load a Verilog source first")
+
+    def analyze_rtl_cost(self, candidate_code: str = "",
+                         path: str = "",
+                         top_n: int = 10,
+                         format: str = "text") -> str:
+        """Analyze RTL cost hotspots without changing or verifying code."""
+        code = self._rtl_code_from_input(candidate_code, path)
+        payload = analyze_rtl_cost_data(code, top_n=top_n)
+        payload["total_cost"] = self._compute_cost(code)
+        if format == "json":
+            return json.dumps(payload, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        lines = [
+            "RTL cost analysis",
+            f"    total_cost      : {payload['total_cost']}",
+            f"    assignment_count: {payload['assignment_count']}",
+            "",
+            "== Cost hotspots ==",
+        ]
+        for item in payload["hotspots"]:
+            lines.append(
+                f"  - cost={item['cost']} lhs={item['lhs']} rhs={item['rhs']}")
+        if payload["duplicate_expressions"]:
+            lines.append("")
+            lines.append("== Duplicate expressions ==")
+            for item in payload["duplicate_expressions"]:
+                lines.append(
+                    f"  - count={item['count']} saving~{item['estimated_saving']} "
+                    f"lhs={', '.join(item['lhs'])} rhs={item['rhs']}")
+        if payload["repeated_fragments"]:
+            lines.append("")
+            lines.append("== Repeated fragments ==")
+            for item in payload["repeated_fragments"]:
+                lines.append(
+                    f"  - {item['kind']} count={item['count']} fragment={item['fragment']}")
+        if payload["hints"]:
+            lines.append("")
+            lines.append("== Suggested rewrite families ==")
+            lines.extend(f"  - {hint}" for hint in payload["hints"])
+        return "\n".join(lines)
+
+    def propose_rtl_rewrites(self, candidate_code: str = "",
+                             path: str = "",
+                             strategies: str = "all",
+                             max_candidates: int = 8,
+                             format: str = "text") -> str:
+        """Generate bounded cost-guided RTL rewrite candidates."""
+        code = self._rtl_code_from_input(candidate_code, path)
+        base_cost = self._compute_cost(code)
+        candidates = propose_rtl_rewrites_data(
+            code, strategies=strategies, max_candidates=max_candidates)
+        rows = []
+        for cand in candidates:
+            try:
+                new_cost = self._compute_cost(cand.code)
+            except Exception as exc:
+                new_cost = None
+                reason = f"cost_error: {exc}"
+            else:
+                reason = ""
+            row = cand.to_dict(include_code=(format == "json"))
+            row["base_cost"] = base_cost
+            row["candidate_cost"] = new_cost
+            row["cost_delta"] = None if new_cost is None else new_cost - base_cost
+            if reason:
+                row["reason"] = f"{row['reason']}; {reason}"
+            rows.append(row)
+        payload = {
+            "base_cost": base_cost,
+            "candidate_count": len(rows),
+            "candidates": rows,
+        }
+        if format == "json":
+            return json.dumps(payload, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        lines = [
+            "RTL rewrite proposals",
+            f"    base_cost : {base_cost}",
+            f"    candidates: {len(rows)}",
+        ]
+        if not rows:
+            lines.append("  (empty)")
+            return "\n".join(lines)
+        for row in rows:
+            lines.append(
+                f"  - {row['candidate_id']} strategy={row['strategy']} "
+                f"cost={row['candidate_cost']} delta={row['cost_delta']} "
+                f"reason={row['reason']}")
+        lines.append("Use format=json to retrieve candidate code for verification or editing.")
+        return "\n".join(lines)
+
+    def optimize_rtl_round(self, candidate_code: str = "",
+                           path: str = "",
+                           strategies: str = "all",
+                           max_candidates: int = 8,
+                           timeout_s: int = 60,
+                           accept_timeout: bool = True,
+                           format: str = "text") -> str:
+        """Run one bounded cost-guided rewrite round with cost and CEC checks."""
+        code = self._rtl_code_from_input(candidate_code, path)
+        base_cost = self._compute_cost(code)
+        proposals = propose_rtl_rewrites_data(
+            code, strategies=strategies, max_candidates=max_candidates)
+        rows = []
+        accepted = []
+        for proposal in proposals:
+            row = proposal.to_dict(include_code=(format == "json"))
+            row["base_cost"] = base_cost
+            try:
+                candidate_cost = self._compute_cost(proposal.code)
+            except Exception as exc:
+                row.update({
+                    "candidate_cost": None,
+                    "cost_delta": None,
+                    "cec_status": "not-run",
+                    "accepted": False,
+                    "reject_reason": f"cost_error: {exc}",
+                })
+                rows.append(row)
+                continue
+            row["candidate_cost"] = candidate_cost
+            row["cost_delta"] = candidate_cost - base_cost
+            if candidate_cost >= base_cost:
+                row.update({
+                    "cec_status": "not-run",
+                    "accepted": False,
+                    "reject_reason": "cost_not_lower",
+                })
+                rows.append(row)
+                continue
+            verification = self._verify_candidate_code(
+                proposal.code, timeout_s=timeout_s)
+            row["cec_status"] = verification.status
+            row["cec_reason"] = verification.reason
+            row["cec_elapsed"] = verification.elapsed
+            is_accepted = verification.status == "cec-proved" or (
+                accept_timeout and verification.status == "cec-timeout-assumed")
+            row["accepted"] = is_accepted
+            if not is_accepted:
+                row["reject_reason"] = verification.reason or verification.status
+            rows.append(row)
+            if is_accepted:
+                accepted.append(row)
+        best = None
+        if accepted:
+            best = min(accepted, key=lambda item: (item["candidate_cost"], item["candidate_id"]))
+        payload = {
+            "base_cost": base_cost,
+            "timeout_s": timeout_s,
+            "candidate_count": len(rows),
+            "accepted_count": len(accepted),
+            "best": best,
+            "candidates": rows,
+        }
+        self._ir_recorder.add_graph_node(
+            "experiment",
+            target="",
+            summary="cost-guided RTL optimization round",
+            data={
+                "base_cost": base_cost,
+                "timeout_s": timeout_s,
+                "accepted_count": len(accepted),
+                "best_strategy": best.get("strategy", "") if best else "",
+                "best_cost": best.get("candidate_cost") if best else None,
+            },
+        )
+        if format == "json":
+            return json.dumps(payload, indent=2, sort_keys=True)
+        if format != "text":
+            raise ValueError("format must be 'text' or 'json'")
+        lines = [
+            "RTL optimization round",
+            f"    base_cost : {base_cost}",
+            f"    timeout_s : {timeout_s}",
+            f"    candidates: {len(rows)}",
+            f"    accepted  : {len(accepted)}",
+        ]
+        if best:
+            lines.append(
+                f"    best      : {best['candidate_id']} {best['strategy']} "
+                f"cost={best['candidate_cost']} delta={best['cost_delta']} "
+                f"cec={best['cec_status']}")
+        for row in rows:
+            lines.append(
+                f"  - {row['candidate_id']} strategy={row['strategy']} "
+                f"cost={row.get('candidate_cost')} delta={row.get('cost_delta')} "
+                f"cec={row.get('cec_status')} accepted={row.get('accepted')} "
+                f"reason={row.get('reject_reason', row.get('reason', ''))}")
+        lines.append("Use format=json to retrieve the best candidate code.")
         return "\n".join(lines)
 
     def _run_cec(self, old_code: str, new_code: str,

@@ -1,5 +1,6 @@
 """Tests for analysis-driven RTL recovery tools."""
 
+import json
 from pathlib import Path
 import shutil
 
@@ -80,6 +81,41 @@ def test_fit_template_recovers_product_and_comparator():
         "y", inputs=["a"], pattern_num=16, validation_num=16)
     assert "comparator-boundary-fitting" in comparator
     assert "exhaustive-exact" in comparator
+
+
+def test_fit_template_recovers_test17_offset_templates():
+    session = CircuitSession()
+    session.load("examples/testcase/test17/top_primitive.v")
+
+    out1 = session.fit_template(
+        "out1",
+        inputs=["in1", "in2"],
+        exhaustive="never",
+        pattern_num=128,
+        validation_num=256,
+    )
+    assert "offset-subtract-template-fitting" in out1
+    assert "out1 = ({1'd0, in2} - {2'd0, in1}) - 33'd2" in out1
+
+    out2 = session.fit_template(
+        "out2",
+        inputs=["in1", "in2"],
+        exhaustive="never",
+        pattern_num=128,
+        validation_num=256,
+    )
+    assert "offset-comparator-template-fitting" in out2
+    assert "out2 = {1'd0, in2} >= ({2'd0, in1} + 33'd10)" in out2
+
+    out3 = session.fit_template(
+        "out3",
+        inputs=["in1", "in2"],
+        exhaustive="never",
+        pattern_num=128,
+        validation_num=256,
+    )
+    assert "offset-comparator-template-fitting" in out3
+    assert "out3 = {2'd0, in1} >= ({1'd0, in2} + 33'd3)" in out3
 
 
 def test_validate_expr_verifies_manual_hypothesis_and_caches_candidate():
@@ -576,12 +612,161 @@ def test_test13_checked_in_recovered_rtl_matches_wolfex_target_cost():
     assert result["success"], result["reason"]
 
 
+def test_cost_guided_rewrite_factors_mux_add_family():
+    code = """module top(in1,in2,in5,in6,in8,in9,out1,out2);
+  input [7:0] in1,in2,in5,in8;
+  input in6,in9;
+  output [15:0] out1,out2;
+  wire [7:0] in1,in2,in5,in8;
+  wire in6,in9;
+  wire [15:0] out1,out2;
+  assign out1 = (in6 ? in5 : 8'd0) + in2 + 8'd24 * in8 + in1;
+  assign out2 = (in9 ? in5 : 8'd0) + in2 + 8'd24 * in8 + in1;
+endmodule
+"""
+    session = CircuitSession()
+    analysis = session.analyze_rtl_cost(candidate_code=code)
+    assert "total_cost      : 10" in analysis
+    assert "try factoring mux-plus-common-addition families" in analysis
+
+    proposals = session.propose_rtl_rewrites(candidate_code=code)
+    assert "strategy=mux_add_factor" in proposals
+    assert "cost=6 delta=-4" in proposals
+
+    session._source_code = code
+    session._current_code = code
+    session._verify_candidate_code = (
+        lambda candidate_code, timeout_s=60: VerificationResult(
+            "cec-proved", "equivalent")
+    )
+    round_report = session.optimize_rtl_round(
+        candidate_code=code,
+        timeout_s=60,
+    )
+    assert "accepted  : 1" in round_report
+    assert "best      : R1 mux_add_factor cost=6 delta=-4 cec=cec-proved" in round_report
+
+
+def test_cost_guided_rewrite_factors_test17_output_relations():
+    code = """module top(in1, in2, in3, out1, out2, out3, out4, out5, out6);
+  input [30:0] in1;
+  input [31:0] in2;
+  input [31:0] in3;
+  output [32:0] out1;
+  output out2;
+  output out3;
+  output [32:0] out4;
+  output out5;
+  output out6;
+
+  wire [32:0] a = in1;
+  wire [32:0] b = in2;
+  wire [32:0] c = in3;
+  wire [32:0] a2 = a + 33'd2;
+  wire [32:0] a10 = a + 33'd10;
+  wire [32:0] b3 = b + 33'd3;
+  wire [32:0] c3 = c + 33'd3;
+
+  assign out1 = b - a2;
+  assign out2 = b >= a10;
+  assign out3 = a >= b3;
+  assign out4 = c - a2;
+  assign out5 = c >= a10;
+  assign out6 = a >= c3;
+endmodule
+"""
+    session = CircuitSession()
+    analysis = session.analyze_rtl_cost(candidate_code=code, top_n=20)
+    assert "lhs=a10 rhs=a + 33'd10" in analysis
+    assert "try factoring predicates through shared output/difference relations" in analysis
+
+    proposals = session.propose_rtl_rewrites(candidate_code=code)
+    assert "strategy=output_relation_factor" in proposals
+    assert "cost=7 delta=-3" in proposals
+
+    session._source_code = code
+    session._current_code = code
+    session._verify_candidate_code = (
+        lambda candidate_code, timeout_s=60: VerificationResult(
+            "cec-proved", "equivalent")
+    )
+    round_report = session.optimize_rtl_round(
+        candidate_code=code,
+        timeout_s=60,
+    )
+    assert "accepted  : 1" in round_report
+    assert "best      : R1 output_relation_factor cost=7 delta=-3 cec=cec-proved" in round_report
+
+
+def test_cost_guided_rewrite_fits_test18_concat_initializer_as_modular_subtract():
+    code = """module top(in1, in2, in3, in4, in5, in6, out1, out2, out3, out4, out5);
+  input [1:0] in1, in2;
+  input [4:0] in3, in5;
+  input [2:0] in4, in6;
+  output [4:0] out1, out3, out5;
+  output out2, out4;
+
+  wire [4:0] addend = {3'd0, in1[1], in1[1], !in1[0]};
+  wire signed [4:0] s_out1 = in2 + addend;
+  wire signed [4:0] s_out3 = in4 + addend;
+  wire signed [4:0] s_in3 = in3;
+  wire signed [4:0] s_in5 = in5;
+
+  assign out1 = s_out1;
+  assign out3 = s_out3;
+  assign out5 = in6 + addend;
+  assign out2 = s_in3 > s_out1;
+  assign out4 = s_in5 > s_out3;
+endmodule
+"""
+    session = CircuitSession()
+    analysis = session.analyze_rtl_cost(candidate_code=code, top_n=20)
+    assert "lhs=addend rhs={3'd0, in1[1], in1[1], !in1[0]}" in analysis
+    assert "try rewriting concat bit-pattern initializers as affine/modular forms" in analysis
+
+    proposals = session.propose_rtl_rewrites(candidate_code=code)
+    assert "strategy=concat_modular_subtract" in proposals
+    assert "cost=6 delta=-7" in proposals
+    assert "strategy=concat_conditional_subtract" in proposals
+    assert "cost=8 delta=-5" in proposals
+    assert "strategy=concat_affine" in proposals
+    assert "cost=10 delta=-3" in proposals
+
+    session._source_code = code
+    session._current_code = code
+    session._verify_candidate_code = (
+        lambda candidate_code, timeout_s=60: VerificationResult(
+            "cec-proved", "equivalent")
+    )
+    round_report = session.optimize_rtl_round(
+        candidate_code=code,
+        timeout_s=60,
+    )
+    assert "accepted  :" in round_report
+    assert "best      : R1 concat_modular_subtract cost=6 delta=-7 cec=cec-proved" in round_report
+
+    first_round = json.loads(session.optimize_rtl_round(
+        candidate_code=code,
+        timeout_s=60,
+        format="json",
+    ))
+    best_code = first_round["best"]["code"]
+    assert "3'd1 - in1" in best_code
+    assert ", out4 =" not in best_code
+
+
 def test_iccad22_skill_uses_short_cec_for_optimization_rounds():
     text = Path("skills/iccad22.md").read_text()
     assert "`round_cec_timeout_s`: normally `60`" in text
     assert "`final_cec_timeout_s`: normally `300`" in text
     assert "verify_rtl_candidate(timeout_s=60)" in text
     assert "verify_rtl_candidate(timeout_s=300)" in text
+    assert "analyze_rtl_cost" in text
+    assert "optimize_rtl_round" in text
+    assert "External comparison baselines are not stop" in text
+    assert "must not cap the search" in text
+    assert "known target cost" not in text
+    assert "leaderboard" not in text
 
 
 def test_recover_expression_is_deprecated_guardrail():
@@ -614,6 +799,9 @@ def test_old_broad_tools_are_not_exposed_by_mcp():
     assert "@mcp.tool()\ndef export_recovery_ir" in text
     assert "@mcp.tool()\ndef promote_recovery_experience" in text
     assert "@mcp.tool()\ndef promote_recovery_memory" in text
+    assert "@mcp.tool()\ndef analyze_rtl_cost" in text
+    assert "@mcp.tool()\ndef propose_rtl_rewrites" in text
+    assert "@mcp.tool()\ndef optimize_rtl_round" in text
 
 
 def test_mcp_tool_descriptions_include_agent_guardrails():
@@ -631,6 +819,11 @@ def test_mcp_tool_descriptions_include_agent_guardrails():
     assert "graph-only recording" in text
     assert "ordinary tool log" in text
     assert "expr_only`` evidence" in text
+    assert "bounded offset comparator" in text
+    assert "template_family" in text
+    assert "cost-guided RTL optimization round" in text
+    assert "does not produce accepted candidates" in text
+    assert "signed-alias collapse" in text
 
 
 def test_recover_rtl_default_guard_and_force_baseline():
